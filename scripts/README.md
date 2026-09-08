@@ -1,0 +1,123 @@
+# Scripts
+
+**Research direction:** [`README.md`](../README.md) · **Upstream setup:** [`docs/FASTWAM_UPSTREAM.md`](../docs/FASTWAM_UPSTREAM.md)
+
+## 目录结构
+
+```text
+scripts/
+├── train.py, train_zero1.sh, train_zero2.sh   # 通用 Hydra 训练入口
+├── precompute_text_embeds.py                   # T5 embedding 预计算
+├── export_text_embed_cache_npz.py              # .pt text cache → .npz（DexJoCo client 用）
+├── run_fastwam_server_async.py                 # DexJoCo 闭环 policy server（async ZMQ）
+├── policy_client_async.py, fastwam_policy_server_async.py, policy_msgpack.py
+├── dexjoco_async/                              # DexJoCo 多卡闭环 eval / collect orchestrator
+├── eval_dexjoco.py                             # DexJoCo 闭环 eval（in-process）
+├── collect_dexjoco.py                          # DexJoCo 闭环 collect → LeRobot
+├── prepare_dexjoco.py                          # DEWO v9 数据处理（scan → pair → Eve/VAE）
+├── collect_dexjoco_rollouts.py                 # 历史 ZMQ collect client
+├── build_rollout_datasets.py                  # 通用 rollout shard merge / failure trim
+├── collect_rollout_trim_and_train.sh          # 通用 collect + trim + train wrapper
+├── water_plant/                                # water_plant 数据准备与薄 wrapper
+├── hammer_nail/                                # hammer_nail 数据准备与薄 wrapper
+├── openloop/                                   # 开环 eval 引擎（多数据集共用）
+├── spray_water_gr00tstyle/                     # 真机 spray_water GR00T-style
+├── diagnose/                                   # 本地诊断（gitignore，不上传）
+├── accelerate_configs/  ds_configs/
+└── archive/  (repo 外)                         # 历史实验
+```
+
+## 按数据集
+
+| 数据集 | 目录 | 说明 |
+|--------|------|------|
+| **water_plant** | [`water_plant/`](water_plant/) | 双视角 + proprio 23d；LeRobot 窗口 / EveRobot event sidecar；DexJoCo 闭环 |
+| **spray_water_gr00tstyle** | [`spray_water_gr00tstyle/`](spray_water_gr00tstyle/) | 真机 3cam rot6d；训练、开环 eval、Wuji deploy |
+
+## 通用训练流程
+
+```bash
+python scripts/precompute_text_embeds.py task=<task_name>
+bash scripts/train_zero1.sh 4 task=<task_name>
+```
+
+## DexJoCo 闭环（唯一入口）
+
+仿真闭环 **eval** / **collect** / **v9 prepare** 都走同一套 in-process 入口（无 ZMQ）：
+
+| 组件 | 文件 |
+|------|------|
+| Eval | `scripts/eval_dexjoco.py` |
+| Collect | `scripts/collect_dexjoco.py` → LeRobot shards + `rollout_raw` |
+| Prepare | `scripts/prepare_dexjoco.py` → scan + pair LeRobot + Eve/VAE |
+| Policy | `src/fastwam/inference/dexjoco.py` |
+
+旧的 async ZMQ orchestrator（`scripts/dexjoco_async/`、`collect_dexjoco_rollouts.py`）仍可用于历史流水线，新实验请用上面三个入口。
+
+```bash
+python scripts/eval_dexjoco.py \
+  --task-name fold_glasses \
+  --run-dir configs/eval/dexjoco/mixed_5task_fastwam_joint \
+  --checkpoint-dir checkpoints/dexjoco/mixed_5task_fastwam_joint/weights \
+  --checkpoint-steps 55000 \
+  --dataset-stats artifacts/mixed_5task/dataset_stats.json \
+  --text-embedding <t5.pt> --no-load-text-encoder \
+  --gpus 1,2,3,4 --text-cfg-scale 0
+
+python scripts/collect_dexjoco.py \
+  --task-name fold_glasses \
+  --run-dir configs/eval/dexjoco/mixed_5task_fastwam_joint \
+  --checkpoint-dir checkpoints/dexjoco/mixed_5task_fastwam_joint/weights \
+  --checkpoint-steps 55000 \
+  --dataset-stats artifacts/mixed_5task/dataset_stats.json \
+  --text-embedding <t5.pt> --no-load-text-encoder \
+  --gpus 1,2,3,4 --text-cfg-scale 0
+
+python scripts/prepare_dexjoco.py \
+  --task-name fold_glasses \
+  --collect-dir collect_results/dexjoco/fold_glasses/<stamp> \
+  --gpus 1,2,3,4
+```
+
+Collect 的 `collect_config.json` 会填上 ckpt / stats / horizon。prepare 默认写到 `prepare_results/dexjoco/<task>/<stamp>/`。训练：
+
+```bash
+TASK=fold_glasses INIT=s0 DEWO_VERSION=v9 GPUS=1,2,3,4 \
+  ENV_FILE=prepare_results/dexjoco/fold_glasses/<stamp>/step_055000/eve_v02/protocol/offline_v1_b1_jump_fast.env \
+  bash scripts/dewo_v2/train.sh
+```
+
+water_plant 一键 collect + trim + train：`bash scripts/water_plant/collect_rollout_200_trim8s_and_train.sh`
+hammer_nail 一键 collect + trim + train：`bash scripts/hammer_nail/collect_rollout_200_trim8s_and_train.sh`
+
+详见 [`dexjoco_async/README.md`](dexjoco_async/README.md)。
+
+## DexJoCo 开源栈 4×50 与 DEWO v2
+
+`checkpoints/dexjoco/*` 与 DEWO v2 **只改环境变量，不要新开一份 .sh**。`GPUS` / `RUN_DIR` / `CKPT` 必填（或显式传入），不要写进文件名。
+
+```bash
+# 开源 baseline / 单任务 4×50
+TASK=fold_glasses GPUS=4,5,6,7 bash scripts/dexjoco/eval_opensource_4x50.sh
+
+# DEWO v2 CFG 4×50
+TASK=hammer_nail RUN_DIR=... CKPT=... TEXT_EMBEDDING_CACHE_DIR=... GPUS=4,5,6,7 \
+  bash scripts/dewo_v2/eval_cfg_official_4x50.sh
+
+# Collect
+TASK=water_plant GPUS=4,5,6,7 bash scripts/dewo_v2/collect_opensource_4x50.sh
+```
+
+任务表：`scripts/dewo_v2/tasks.py`。兼容包装在 `scripts/fold_glasses/`、`scripts/hammer_nail/`、`scripts/water_plant/`，只设置 `TASK=`。
+
+## Full DiT（无 LoRA）
+
+DEWO v2 只用全参 Hydra：`dexjoco_dewo_v2_offline_b1_jump_fast_full_1e-4`（scratch）或 `dexjoco_dewo_v2_offline_b1_jump_fast_full_s0`（从 S0 续训）。没有 LoRA 方案。不要再走已删除的 384 `train_2cam` 任务。
+
+## 其他
+
+| 位置 | 说明 |
+|------|------|
+| `scripts/diagnose/` | 本地 sim-vs-real 诊断，gitignore |
+| `scripts/run_fastwam_server.py` | 真机 / 调试用 sync server（非 DexJoCo 闭环主线） |
+| `openloop/run_robotwin_openloop*.py` | 已弃用 shim，请用 `run_openloop.py` |

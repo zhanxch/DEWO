@@ -1,0 +1,9 @@
+# @package _global_
+# Deprecated historical name. Use `openloop.yaml` for new runs.
+
+defaults:
+  - openloop
+  - _self_
+
+OPENLOOP:
+  output_dir: ./evaluate_results/robotwin_openloop/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}

@@ -1,0 +1,107 @@
+# @package _global_
+# DEWO(scratch) on FastWAMJoint: full DiT from Wan + ActionDiT, not frozen-S0 KV.
+# Pool is still D0 / D+ / D_fail (dewo_scratch_pool). D+ has video BC.
+# Value head: V(s_t) on current-frame VideoDiT tokens, backbone stop-grad.
+# Mix video+action together; do not pin video to base.
+
+defaults:
+  - override /data: dewo_v9_eve_cfg
+  - override /model: fastwam_joint
+  - _self_
+
+output_dir: ${oc.env:DEWO_OUTPUT_DIR,./runs/dexjoco_dewo_scratch_joint}/${oc.env:RUN_ID}
+
+train_mode: full_dit
+
+batch_size: 32
+num_workers: 4
+role_balanced_sampling:
+  enabled: false
+  seed: ${seed}
+
+data:
+  train:
+    unit_filter: dewo_scratch_pool
+    episode_sample_stride: 1
+    event_sample_stride: 1
+    value_gamma: 0.99
+  val:
+    unit_filter: dewo_scratch_pool
+    episode_sample_stride: 1
+    event_sample_stride: 1
+    value_gamma: 0.99
+
+model:
+  load_vae: false
+  fill_vae_latent_cache: false
+  proprio_dim: ${data.train.processor.proprio_output_dim}
+  skip_dit_load_from_pretrain: false
+  mot_checkpoint_mixed_attn: false
+  action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+  video_dit_config:
+    use_gradient_checkpointing: true
+  action_dit_config:
+    use_gradient_checkpointing: true
+  loss:
+    lambda_video: 1.0
+    lambda_action: 1.0
+  uncond_adapter: null
+  value_head:
+    enabled: true
+    encoder: video_dit
+    in_channels: 3072
+    hidden: 256
+    loss: huber
+    gamma: 0.99
+    lambda_value: 1.0
+    lambda_cliff: 0.0
+    cliff_margin: 0.2
+    v_high: null
+    drop_delta: 0.15
+
+lr_scheduler_type: cosine
+learning_rate: 1.0e-4
+num_epochs: 100
+max_steps: 300000
+log_every: 10
+# Weights every 5k (keep all). Optimizer state every 5k, keep only the latest.
+save_every: 5000
+save_weights_every: 5000
+save_weight_steps: []
+save_state_every: 5000
+state_keep_last: 1
+eval_every: 0
+eval_num_inference_steps: 10
+eval_num_samples: 8
+eval_seed: 20260812
+best_metric: val_base_loss
+best_metric_mode: min
+
+gradient_accumulation_steps: 1
+mixed_precision: bf16
+seed: 42
+max_grad_norm: 1.0
+weight_decay: 0.01
+resume: null
+resume_experts: null
+
+experiment_provenance:
+  protocol: ${oc.env:DEWO_PROTOCOL,dewo_scratch_joint}
+  variant: ${oc.env:FITWAM_VARIANT,DEWO-scratch-joint}
+  stack: opensource_224_zscore
+  source_checkpoint_sha256: ${oc.env:FASTWAM_RESUME_SHA256}
+  source_config_sha256: ${oc.env:FASTWAM_SOURCE_CONFIG_SHA256}
+  manifest_sha256: ${oc.env:EVE_MANIFEST_SHA256}
+  selection_manifest_sha256: ${oc.env:EVE_VAL_MANIFEST_SHA256}
+  code_snapshot_sha256: ${oc.env:FITWAM_CODE_SNAPSHOT_SHA256}
+  normalization_kind: ${oc.env:NORM_STATS_SOURCE}
+  normalization_bundle_sha256: ${oc.env:NORM_STATS_BUNDLE_SHA256}
+  text_embedding_cache_sha256: ${oc.env:TEXT_EMBEDDING_CACHE_SHA256}
+
+wandb:
+  enabled: true
+  workspace: ${oc.env:WANDB_ENTITY,null}
+  project: ${oc.env:WANDB_PROJECT,fitwam}
+  name: ${oc.env:WANDB_RUN_NAME}
+  group: ${oc.env:FITWAM_WANDB_GROUP,dewo_scratch_joint}
+  mode: ${oc.env:WANDB_MODE,offline}

@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Launch an async FastWAM inference policy server (concurrent ZMQ clients)."""
+
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+from pathlib import Path
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_ROOT = Path(__file__).resolve().parent
+SRC_ROOT = PROJECT_ROOT / "src"
+for path in (PROJECT_ROOT, SRC_ROOT, SCRIPTS_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from fastwam_policy_server_async import DEFAULT_ASYNC_SERVER_PORT, PolicyServerAsync
+from run_fastwam_server import (
+    FastWAMPolicy,
+    MockFastWAMPolicy,
+    _build_policy_from_run,
+    _resolve_run_dir,
+)
+
+
+class FastWAMPolicyAsync(FastWAMPolicy):
+    """FastWAM policy with batched request helper (sequential GPU infer under the hood)."""
+
+    def get_actions_batch(
+        self,
+        observations: list[dict[str, Any]],
+        options: dict | None = None,
+    ) -> dict[str, Any]:
+        if not observations:
+            raise ValueError("observations must be a non-empty list")
+        actions = []
+        for observation in observations:
+            result = self.get_action(observation=observation, options=options)
+            if isinstance(result, (list, tuple)) and len(result) == 2:
+                result = result[0]
+            if not isinstance(result, dict) or "action" not in result:
+                raise RuntimeError(f"Unexpected get_action result in batch path: {type(result)}")
+            actions.append(result["action"])
+        return {"actions": actions, "action_horizon": self.action_horizon}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run FastWAM async ZMQ policy server (supports concurrent eval workers)."
+    )
+    parser.add_argument("--mock", action="store_true", help="Start mock policy (no model load).")
+    parser.add_argument("--run-dir", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    normalization = parser.add_mutually_exclusive_group()
+    normalization.add_argument("--dataset-stats-path", type=str, default=None)
+    normalization.add_argument("--norm-stats-meta-dir", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--action-horizon", type=int, default=None)
+    parser.add_argument("--num-inference-steps", type=int, default=None)
+    parser.add_argument(
+        "--inference-seed",
+        type=int,
+        default=None,
+        help="Override EVALUATION.seed for deterministic diffusion sampling.",
+    )
+    parser.add_argument(
+        "--text-cfg-scale",
+        type=float,
+        default=None,
+        help=(
+            "Action CFG mix weight w in ε_base + w(ε_posi-ε_base). "
+            "0=本体 (base prompt, adapter off), 1=纯优势 (success + adapter), "
+            ">1=CFG guide (e.g. 2)."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-cfg-tau",
+        type=float,
+        default=None,
+        help=(
+            "If set, freeze mix from NFE0 exec RMS: E>tau uses --text-cfg-scale, "
+            "else mix w=0 (本体). Requires text_cfg_scale != 0."
+        ),
+    )
+    parser.add_argument(
+        "--cfg-epsilon-l",
+        "--epsilon-l",
+        "--cfg-residual-epsilon",
+        dest="cfg_epsilon_l",
+        type=float,
+        default=None,
+        help=(
+            "Bound the per-token action CFG residual before text-cfg scaling. "
+            "None keeps legacy unbounded guidance; 0 is the base branch."
+        ),
+    )
+    parser.add_argument(
+        "--cfg-residual-clip-mode",
+        choices=("rms", "elementwise"),
+        default=None,
+        help="How --cfg-epsilon-l bounds the residual (default: rms).",
+    )
+    parser.add_argument("--negative-prompt", type=str, default=None)
+    parser.add_argument(
+        "--failure-prompt",
+        type=str,
+        default=None,
+        help="Failure-conditioned prompt for DEWO v7 CFG (prompt-mode servers).",
+    )
+    parser.add_argument(
+        "--backbone-checkpoint",
+        type=str,
+        default=None,
+        help="Frozen base MoT for DEWO v5 CFG (adapter-off branch).",
+    )
+    parser.add_argument(
+        "--uncond-adapter",
+        type=str,
+        default=None,
+        help="DEWO v5 uncond-adapter weights. If omitted, --checkpoint may be the adapter file.",
+    )
+    parser.add_argument(
+        "--load-text-encoder",
+        dest="load_text_encoder",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=DEFAULT_ASYNC_SERVER_PORT)
+    parser.add_argument("--api-token", type=str, default=None)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=8,
+        help="Thread pool size for concurrent client request handling.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    print("Starting FastWAM async inference server...", flush=True)
+    print(f"  Host: {args.host}", flush=True)
+    print(f"  Port: {args.port}", flush=True)
+    print(f"  Worker threads: {args.num_workers}", flush=True)
+
+    if args.mock:
+        policy = MockFastWAMPolicy()
+        print("  Policy: mock (no checkpoint)", flush=True)
+    else:
+        if not args.run_dir or not args.checkpoint:
+            raise ValueError("--run-dir and --checkpoint are required unless --mock is set.")
+        run_dir = Path(args.run_dir).expanduser().resolve()
+        base_policy = _build_policy_from_run(
+            run_dir=run_dir,
+            checkpoint=args.checkpoint,
+            dataset_stats_path=args.dataset_stats_path,
+            norm_stats_meta_dir=args.norm_stats_meta_dir,
+            device=args.device,
+            action_horizon=args.action_horizon,
+            num_inference_steps=args.num_inference_steps,
+            load_text_encoder=args.load_text_encoder,
+            inference_seed=args.inference_seed,
+            text_cfg_scale=getattr(args, "text_cfg_scale", None),
+            negative_prompt=getattr(args, "negative_prompt", None),
+            failure_prompt=getattr(args, "failure_prompt", None),
+            backbone_checkpoint=getattr(args, "backbone_checkpoint", None),
+            uncond_adapter=getattr(args, "uncond_adapter", None),
+            adaptive_cfg_tau=getattr(args, "adaptive_cfg_tau", None),
+            cfg_epsilon_l=getattr(args, "cfg_epsilon_l", None),
+            cfg_residual_clip_mode=getattr(args, "cfg_residual_clip_mode", None),
+        )
+        policy = FastWAMPolicyAsync(
+            model=base_policy.model,
+            processor=base_policy.processor,
+            device=base_policy.device,
+            action_horizon=base_policy.action_horizon,
+            num_inference_steps=base_policy.num_inference_steps,
+            num_video_frames=base_policy.num_video_frames,
+            text_cfg_scale=base_policy.text_cfg_scale,
+            negative_prompt=base_policy.negative_prompt,
+            failure_prompt=getattr(base_policy, "failure_prompt", None),
+            sigma_shift=base_policy.sigma_shift,
+            seed=base_policy.seed,
+            rand_device=base_policy.rand_device,
+            tiled=base_policy.tiled,
+            adaptive_cfg_tau=getattr(base_policy, "adaptive_cfg_tau", None),
+            cfg_exec_horizon=getattr(base_policy, "cfg_exec_horizon", 24),
+            cfg_epsilon_l=getattr(base_policy, "cfg_epsilon_l", None),
+            cfg_residual_clip_mode=getattr(base_policy, "cfg_residual_clip_mode", "rms"),
+            model_provenance=getattr(base_policy, "model_provenance", None),
+        )
+        print(f"  Run dir: {_resolve_run_dir(run_dir)}", flush=True)
+        print(f"  Device: {args.device}", flush=True)
+
+    server = PolicyServerAsync(
+        policy=policy,
+        host=args.host,
+        port=args.port,
+        api_token=args.api_token,
+        num_workers=args.num_workers,
+    )
+    print(f"\n✓ Async server ready — listening on {args.host}:{args.port}\n", flush=True)
+    def _terminate(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _terminate)
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        print("\nShutting down async server...", flush=True)
+
+
+if __name__ == "__main__":
+    main()
