@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+# v9.1 helpers live in v91_pool.py (no stitch, D_fail starts at M).
+
 MIN_EVENT_FRAMES = 33
 FAIL_CLIFF_POST = 24
 

@@ -120,3 +120,26 @@ done
 
 STAMP=20260907_141408 bash /gaozt-test1/zhanxch/FITWAM-dewov9-20260828/scripts/prepare_mixed5_joint_gpus123.sh
 
+# Joint train (DEWOv9 adapter from frozen S0). Default: inline, like eval/collect.
+# Scratch: --init scratch (full FastWAMJoint from Wan + ActionDiT).
+
+ROOT=/gaozt-test1/zhanxch/FITWAM-dewov9-20260828
+ENV=/gaozt-test1/zhanxch/miniconda3/envs/fastwam
+
+export TOKENIZERS_PARALLELISM=false
+export DIFFSYNTH_SKIP_DOWNLOAD=true
+export DIFFSYNTH_MODEL_BASE_PATH="${ROOT}/checkpoints"
+export PYTHONPATH="${ROOT}/src:${ROOT}/scripts:${PYTHONPATH:-}"
+
+"${ENV}/bin/python" "${ROOT}/scripts/train_dexjoco.py" \
+  --task-name fold_glasses \
+  --init s0 \
+  --prepare-dir "${ROOT}/prepare_results/dexjoco/fold_glasses/<stamp>" \
+  --gpus 1,2,3,4
+
+# Scratch FastWAMJoint (same prepare stamp / mixed concat env):
+# "${ENV}/bin/python" "${ROOT}/scripts/train_dexjoco.py" \
+#   --task-name fold_glasses --init scratch \
+#   --prepare-dir "${ROOT}/prepare_results/dexjoco/fold_glasses/<stamp>" \
+#   --gpus 1,2,3,4
+

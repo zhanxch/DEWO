@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
-"""DEWO v9 data prep after ``scripts/collect_dexjoco.py``.
+"""DEWO v9 / v9.1 data prep after ``scripts/collect_dexjoco.py``.
 
 In-process CLI, same house style as ``eval_dexjoco.py`` / ``collect_dexjoco.py``.
 Reads a collect stamp (or a legacy ``rollout_raw_200`` root) and writes:
 
-  scan → critic index → full-horizon pair LeRobot → Eve manifests + text/VAE
+  scan → scan_d0 → critic index → pool LeRobot → Eve manifests + text/VAE
+
+v9.1 (default): D0 = expert ∪ collect successes, D_scan / D_fail / D+ crops,
+no stitch. ``scan_d0`` labels D0 collect successes with real Pass@M V
+(sparse, no interpolation; expert D0 stays V-off). v9 keeps the old
+full-horizon pair stitch.
 
 hammer_nail prepare D0 only includes env successes whose length is at most
 expert_max + 10. Longer successes stay successes; they are not train/val D0.
 Eval and collect are unchanged.
 
-Example (Joint collect stamp, avoid GPU 0)::
+Example (Joint collect stamp)::
 
     python scripts/prepare_dexjoco.py \\
       --task-name fold_glasses \\
       --collect-dir collect_results/dexjoco/fold_glasses/20260907_141408 \\
-      --gpus 1,2,3
+      --gpus 0,1,2,3
+
+Incremental D0 collect V on an existing stamp (does not redo failure scan)::
+
+    python scripts/prepare_dexjoco.py \\
+      --task-name fold_glasses \\
+      --collect-dir collect_results/dexjoco/fold_glasses/20260907_141408 \\
+      --output-dir prepare_results/dexjoco/fold_glasses/20260908_090014 \\
+      --phases scan_d0 \\
+      --gpus 0,2
 """
 
 from __future__ import annotations
@@ -46,10 +60,12 @@ for _path in (
         sys.path.insert(0, str(_path))
 
 import eval_dexjoco as eval_entry
-from dewo_v2.tasks import CfgRecipe, eval_task_yaml, get_task, resolve_collect_max_steps
+from dewo_v2.tasks import CfgRecipe, eval_task_yaml, get_task, resolve_collect_max_steps, resolve_expert
 
-ALL_PHASES = ("scan", "critic", "materialize", "eve")
-HYDRA_TASK = "dexjoco/dexjoco_dewo_v9_offline_b1_jump_fast_uncond"
+ALL_PHASES = ("scan", "scan_d0", "critic", "materialize", "eve")
+HYDRA_S0 = "dexjoco/dexjoco_dewo_v9_offline_b1_jump_fast_uncond"
+HYDRA_SCRATCH = "dexjoco/dexjoco_dewo_scratch_joint"
+HYDRA_TASK = HYDRA_S0
 PRIMARY_KIND = "all_success_seeds"
 PRIMARY_SEED = 20260820
 STEP_DIR_RE = re.compile(r"^step_(\d+)$")
@@ -66,6 +82,18 @@ CFG_ENV = {
     "CFG_AUX_FAIL_FAST": "0.0",
     "CFG_AUX_FAIL_BASE": "0.0",
 }
+
+
+def is_v91(version: str | None) -> bool:
+    return str(version or "").strip() in {"v9.1", "v91"}
+
+
+def prepare_hydra_task(version: str | None) -> str:
+    return HYDRA_SCRATCH if is_v91(version) else HYDRA_S0
+
+
+def pool_index_path(pair_out: Path, version: str | None) -> Path:
+    return pair_out / ("pool_index.json" if is_v91(version) else "pair_index.json")
 
 
 def _utc_now() -> str:
@@ -206,6 +234,15 @@ def scan_is_complete(scan_root: Path) -> bool:
     return summary.get("status") == "complete" and n_pairs > 0
 
 
+def scan_d0_is_complete(scan_root: Path) -> bool:
+    summary_path = Path(scan_root) / "summary.json"
+    if not summary_path.is_file():
+        return False
+    summary = _read_json(summary_path)
+    n_prefix = int(summary.get("num_prefix_results") or 0)
+    return summary.get("status") == "complete" and n_prefix > 0
+
+
 def _find_existing_critic(collect_dir: Path, step_dir: Path) -> Path | None:
     for path in (
         step_dir / "v9_critic_index.json",
@@ -289,13 +326,108 @@ def run_scan(
         "--pass-m",
         str(args.pass_m),
         "--skip-pin-check",
-        "--overwrite",
     ]
     if args.text_embedding is not None:
         cmd.extend(["--text-embedding", str(args.text_embedding)])
+    if args.overwrite:
+        cmd.append("--overwrite")
     _run(cmd)
     if not scan_is_complete(scan_root):
         raise RuntimeError(f"Scan did not complete at {scan_root}")
+
+
+def write_d0_value_index(scan_root: Path, dest: Path) -> Path:
+    from dewo_v2.d0_collect_value import (
+        build_d0_value_index,
+        load_jsonl,
+        write_d0_value_index as _write,
+    )
+
+    prefixes = load_jsonl(scan_root / "prefix_results.jsonl")
+    payload = build_d0_value_index(prefixes, scan_root=scan_root)
+    _write(dest, payload)
+    print(
+        f"[prepare] D0 value index {dest} "
+        f"episodes={payload['num_episodes']} "
+        f"frames={payload['num_labeled_frames']}",
+        flush=True,
+    )
+    return dest
+
+
+def run_scan_d0(
+    *,
+    raw: Path,
+    scan_root: Path,
+    value_index: Path,
+    args: argparse.Namespace,
+    step: int,
+) -> None:
+    if scan_d0_is_complete(scan_root) and value_index.is_file() and not args.overwrite:
+        print(f"[step {step}] D0 collect scan already complete; skipping {scan_root}", flush=True)
+        return
+    cmd = [
+        _python(),
+        str(REPO_ROOT / "scripts" / "fold_glasses" / "run_recoverability_pair_scan.py"),
+        "--gpus",
+        _gpu_csv(args.gpus),
+        "--dataset",
+        str(raw),
+        "--output",
+        str(scan_root),
+        "--checkpoint",
+        str(eval_entry._checkpoint_path(args.checkpoint_dir, step)),
+        "--model-config",
+        str(args.model_config),
+        "--dataset-stats",
+        str(args.dataset_stats),
+        "--task-name",
+        str(args.task_name),
+        "--max-steps",
+        str(args.max_steps),
+        "--action-horizon",
+        str(args.action_horizon),
+        "--replan-steps",
+        str(args.replan_steps),
+        "--num-inference-steps",
+        str(args.num_inference_steps),
+        "--pass-m",
+        str(args.pass_m),
+        "--selection",
+        "d0_collect",
+        "--skip-pin-check",
+    ]
+    if args.text_embedding is not None:
+        cmd.extend(["--text-embedding", str(args.text_embedding)])
+    if args.overwrite:
+        cmd.append("--overwrite")
+    _run(cmd)
+    if not scan_d0_is_complete(scan_root):
+        raise RuntimeError(f"D0 collect scan did not complete at {scan_root}")
+    write_d0_value_index(scan_root, value_index)
+
+
+def run_result_videos(
+    *,
+    scan_root: Path,
+    raw: Path,
+    output_dir: Path,
+    overwrite: bool,
+) -> None:
+    cmd = [
+        _python(),
+        str(REPO_ROOT / "scripts" / "fold_glasses" / "compose_failure_recoverability_videos.py"),
+        "--scan-root",
+        str(scan_root),
+        "--raw-dataset",
+        str(raw),
+        "--output-dir",
+        str(output_dir),
+    ]
+    if overwrite:
+        cmd.append("--overwrite")
+    cmd.extend(["--jobs", "2"])
+    _run(cmd)
 
 
 def run_critic(
@@ -340,14 +472,20 @@ def run_materialize(
     success_prompt: str,
     overwrite: bool,
     step: int,
+    dewo_version: str,
 ) -> Path:
-    pair_index = pair_out / "pair_index.json"
-    if pair_index.is_file() and not overwrite:
-        print(f"[step {step}] reuse pair LeRobot {pair_out}", flush=True)
+    index_path = pool_index_path(pair_out, dewo_version)
+    if index_path.is_file() and not overwrite:
+        print(f"[step {step}] reuse pool LeRobot {pair_out}", flush=True)
         return pair_out
+    script = (
+        "materialize_v91_pool_lerobot.py"
+        if is_v91(dewo_version)
+        else "materialize_v9_full_pair_lerobot.py"
+    )
     cmd = [
         _python(),
-        str(REPO_ROOT / "scripts" / "dewo_v2" / "materialize_v9_full_pair_lerobot.py"),
+        str(REPO_ROOT / "scripts" / "dewo_v2" / script),
         "--critic-index",
         str(critic_path),
         "--source-dataset",
@@ -359,8 +497,8 @@ def run_materialize(
         "--overwrite",
     ]
     _run(cmd)
-    if not pair_index.is_file():
-        raise RuntimeError(f"Missing pair_index.json after materialize: {pair_index}")
+    if not index_path.is_file():
+        raise RuntimeError(f"Missing {index_path.name} after materialize: {index_path}")
     return pair_out
 
 
@@ -377,6 +515,7 @@ def _write_protocol_files(
     pair_manifest: Path,
     val_manifest: Path,
     env_file: Path,
+    expert_root: Path | None = None,
 ) -> None:
     spec = get_task(args.task_name)
     recipe = CfgRecipe()
@@ -413,13 +552,17 @@ def _write_protocol_files(
     )
     src_cfg_sha = _sha256_file(args.model_config)
     norm_sha = _sha256_file(args.dataset_stats)
+    hydra_task = prepare_hydra_task(getattr(args, "dewo_version", None))
+    v91 = is_v91(getattr(args, "dewo_version", None))
     values = {
         "FITWAM_ENV_PREFIX": str(Path(_python()).parent),
         "TASK": args.task_name,
         "DEWO_TASK_NAME": args.task_name,
+        "DEWO_VERSION": "v9.1" if v91 else "v9",
         "BASE_DATASET": str(raw),
         "PAIR_DATASET": str(pair_out),
         "ROLLOUT_RAW": str(raw),
+        "EXPERT_DATASET": str(expert_root) if expert_root is not None else "",
         "PRIMARY_KIND": PRIMARY_KIND,
         "PRIMARY_N": 15,
         "CKPT": str(ckpt),
@@ -443,16 +586,30 @@ def _write_protocol_files(
         "USE_VAE_LATENT_CACHE": 1 if args.use_vae else 0,
         "VAE_LATENT_CACHE_DIR": str(vae_cache),
         "REQUIRE_VAE_LATENT_CACHE": 1 if args.use_vae else 0,
-        "DEWO_TASK": HYDRA_TASK,
-        "DEWO_VARIANT": "B1-jump-fast-v9-uncond-adapter",
-        "DEWO_PROTOCOL": f"{args.task_name}_dewo_v9_uncond_adapter_isolated",
-        "DEWO_OUTPUT_DIR": f"./runs/dexjoco_{args.task_name}_dewo_v9",
-        "FITWAM_WANDB_GROUP": f"{args.task_name}_dewo_v9_opensource",
+        "DEWO_TASK": hydra_task,
+        "DEWO_VARIANT": (
+            "DEWO-scratch-joint" if v91 else "B1-jump-fast-v9-uncond-adapter"
+        ),
+        "DEWO_PROTOCOL": (
+            f"{args.task_name}_dewo_scratch_joint"
+            if v91
+            else f"{args.task_name}_dewo_v9_uncond_adapter_isolated"
+        ),
+        "DEWO_OUTPUT_DIR": (
+            f"./runs/dexjoco_{args.task_name}_dewo_scratch_joint"
+            if v91
+            else f"./runs/dexjoco_{args.task_name}_dewo_v9"
+        ),
+        "FITWAM_WANDB_GROUP": (
+            f"{args.task_name}_dewo_scratch_joint"
+            if v91
+            else f"{args.task_name}_dewo_v9_opensource"
+        ),
         "SUCCESS_PROMPT": args.success_prompt,
     }
     lines = [
         "# Generated by scripts/prepare_dexjoco.py (opensource 224 / z-score)",
-        "# Paths / VAE / text cache only. CFG mixing is DEWO v9 in scripts/dewo_v2/train.sh",
+        "# Paths / VAE / text cache only. CFG mixing is owned by scripts/train_dexjoco.py",
         "# (Successful / Failed execution., D+ 0.9/0/0.1, D_fail 1.0/0/0, no FAST).",
     ]
     lines.extend(_shell_export(key, value) for key, value in values.items())
@@ -461,16 +618,24 @@ def _write_protocol_files(
     eval_entry._write_json(
         protocol / "offline_v1_b1_jump_fast.json",
         {
-            "protocol": f"{args.task_name}_dewo_v9_recoverability_pairs",
-            "variant": "B1-jump-fast-v9-uncond-adapter",
+            "protocol": (
+                f"{args.task_name}_dewo_v91_scratch_pool"
+                if v91
+                else f"{args.task_name}_dewo_v9_recoverability_pairs"
+            ),
+            "variant": (
+                "DEWO-scratch-joint" if v91 else "B1-jump-fast-v9-uncond-adapter"
+            ),
             "stack": "opensource_224_zscore",
             "manifest": str(pair_manifest),
             "val_manifest": str(val_manifest),
             "pair_dataset": str(pair_out),
+            "expert_dataset": str(expert_root) if expert_root is not None else None,
             "pretrained_norm_stats": str(args.dataset_stats),
             "source_config": str(args.model_config),
             "checkpoint": str(ckpt),
             "include_s0_success_rollouts": True,
+            "include_expert_success": bool(v91),
             "primary_kind": PRIMARY_KIND,
             "cfg": {
                 "success_suffix": " Successful execution.",
@@ -478,7 +643,7 @@ def _write_protocol_files(
                 "primary": "0.9,0.0,0.1",
                 "aux_success": "1.0,0.0,0.0",
                 "aux_fail": "1.0,0.0,0.0",
-                "note": "Owned by scripts/dewo_v2/train.sh; not mixed from this file.",
+                "note": "Owned by scripts/train_dexjoco.py; not mixed from this file.",
             },
         },
     )
@@ -524,6 +689,9 @@ def run_eve(
     val_manifest = eve_root / "manifests" / "offline_selection_primary_success.json"
     primary_id = f"{args.task_name}_s0_success_rollouts"
     pair_id = f"{args.task_name}_pair_events"
+    expert_id = f"{args.task_name}_expert_success"
+    v91 = is_v91(getattr(args, "dewo_version", None))
+    hydra_task = prepare_hydra_task(getattr(args, "dewo_version", None))
 
     if (
         env_file.is_file()
@@ -534,8 +702,16 @@ def run_eve(
         print(f"[step {step}] reuse Eve protocol {env_file}", flush=True)
         return env_file
 
+    expert_root = resolve_expert(get_task(args.task_name)) if v91 else None
+    expert_eve = step_dir / "eve_expert" if v91 else None
+
     if args.overwrite and eve_root.exists():
         shutil.rmtree(eve_root)
+    if args.overwrite and expert_eve is not None and expert_eve.exists():
+        shutil.rmtree(expert_eve)
+
+    eve_root.mkdir(parents=True, exist_ok=True)
+    (eve_root / "protocol").mkdir(parents=True, exist_ok=True)
 
     splits = eve_root / "splits" / "episode_splits.jsonl"
     if not splits.is_file() or args.overwrite:
@@ -593,7 +769,10 @@ def run_eve(
         )
 
     primary_manifest = eve_root / "manifests" / "offline_primary_success.json"
-    print(f"[step {step}] build primary + pair manifests", flush=True)
+    expert_manifest = (
+        expert_eve / "manifests" / "offline_expert_success.json" if expert_eve is not None else None
+    )
+    print(f"[step {step}] build primary + pool manifests", flush=True)
     _run(
         [
             _python(),
@@ -613,29 +792,106 @@ def run_eve(
             "train",
         ]
     )
-    _run(
-        [
-            _python(),
-            str(REPO_ROOT / "scripts" / "dewo_v2" / "build_pair_manifest.py"),
-            "--expert-manifest",
-            str(primary_manifest),
-            "--pair-dataset",
-            str(pair_out),
-            "--pair-dataset-id",
-            pair_id,
-            "--prompt",
-            str(args.success_prompt),
-            "--recipe",
-            f"{args.task_name}_dewo_v9_recoverability_pairs",
-            "--output",
-            str(pair_manifest),
-            "--primary-source",
-            PRIMARY_KIND,
-            "--horizon",
-            "full",
-            "--skip-aux-success",
+    if v91:
+        if expert_root is None or expert_eve is None:
+            raise RuntimeError("v9.1 prepare requires the expert LeRobot dataset")
+        if not (expert_eve / "episode_meta.jsonl").is_file() or args.overwrite:
+            print(f"[step {step}] init Eve sidecar on expert successes {expert_root}", flush=True)
+            _run(
+                [
+                    _python(),
+                    str(REPO_ROOT / "scripts" / "everobot" / "build_eve_sidecar.py"),
+                    "init-base",
+                    "--dataset-root",
+                    str(expert_root),
+                    "--dataset-id",
+                    expert_id,
+                    "--eve-root",
+                    str(expert_eve),
+                    "--task-name",
+                    str(args.task_name),
+                    "--source-type",
+                    "expert_success",
+                    "--source-policy",
+                    "human_or_expert",
+                    "--collection-round",
+                    "-1",
+                    "--force-success",
+                    "--split",
+                    "train",
+                    "--config-path",
+                    str(args.model_config),
+                    "--code-commit",
+                    _git_head(REPO_ROOT),
+                ]
+            )
+        _run(
+            [
+                _python(),
+                str(REPO_ROOT / "scripts" / "everobot" / "build_eve_sidecar.py"),
+                "build-manifest",
+                "--eve-root",
+                str(expert_eve),
+                "--manifest-name",
+                "offline_expert_success",
+                "--include-outcomes",
+                "success",
+                "--success-dataset-ids",
+                expert_id,
+                "--success-sample-mode",
+                "episode_only",
+                "--splits",
+                "train",
+            ]
+        )
+        v91_cmd = [
+                _python(),
+                str(REPO_ROOT / "scripts" / "dewo_v2" / "build_v91_manifest.py"),
+                "--collect-manifest",
+                str(primary_manifest),
+                "--expert-manifest",
+                str(expert_manifest),
+                "--pool-index",
+                str(pair_out / "pool_index.json"),
+                "--pool-dataset",
+                str(pair_out),
+                "--pool-dataset-id",
+                pair_id,
+                "--prompt",
+                str(args.success_prompt),
+                "--recipe",
+                f"{args.task_name}_dewo_v91_scratch_pool",
+                "--output",
+                str(pair_manifest),
         ]
-    )
+        d0_value_index = step_dir / "d0_collect_value_index.json"
+        if d0_value_index.is_file():
+            v91_cmd.extend(["--d0-value-index", str(d0_value_index)])
+        _run(v91_cmd)
+    else:
+        _run(
+            [
+                _python(),
+                str(REPO_ROOT / "scripts" / "dewo_v2" / "build_pair_manifest.py"),
+                "--expert-manifest",
+                str(primary_manifest),
+                "--pair-dataset",
+                str(pair_out),
+                "--pair-dataset-id",
+                pair_id,
+                "--prompt",
+                str(args.success_prompt),
+                "--recipe",
+                f"{args.task_name}_dewo_v9_recoverability_pairs",
+                "--output",
+                str(pair_manifest),
+                "--primary-source",
+                PRIMARY_KIND,
+                "--horizon",
+                "full",
+                "--skip-aux-success",
+            ]
+        )
     _run(
         [
             _python(),
@@ -670,6 +926,7 @@ def run_eve(
         pair_manifest=pair_manifest,
         val_manifest=val_manifest,
         env_file=env_file,
+        expert_root=expert_root,
     )
 
     hydra_env = _hydra_env(_load_exports(env_file))
@@ -678,7 +935,7 @@ def run_eve(
         [
             _python(),
             str(REPO_ROOT / "scripts" / "precompute_text_embeds.py"),
-            f"task={HYDRA_TASK}",
+            f"task={hydra_task}",
         ],
         env=hydra_env,
     )
@@ -714,7 +971,7 @@ def run_eve(
         cmd = [
             _python(),
             str(REPO_ROOT / "scripts" / "precompute_vae_latents.py"),
-            f"task={HYDRA_TASK}",
+            f"task={hydra_task}",
             f"+vae_latent_cache_dir={vae_cache}",
             f"+encode_val={str(args.vae_encode_val).lower()}",
         ]
@@ -763,6 +1020,7 @@ def _write_results_md(
         "",
         f"Collect: `{config.get('collect_dir', '')}`",
         f"Output: `{output_dir}`",
+        f"Failure + V(s) videos: `{output_dir / 'result'}`",
         "",
         "| Ckpt | Scan pairs | Pair episodes | Env |",
         "|---|---:|---:|---|",
@@ -782,8 +1040,9 @@ def _write_results_md(
                     "Next:",
                     "",
                     "```bash",
-                    f"TASK={task} INIT=s0 DEWO_VERSION=v9 GPUS=<ids> \\",
-                    f"  ENV_FILE={env_file} bash scripts/dewo_v2/train.sh",
+                    f"python scripts/train_dexjoco.py \\",
+                    f"  --task-name {task} --init scratch --dewo-version v9.1 \\",
+                    f"  --prepare-dir {output_dir} --gpus 0,1,2,3",
                     "```",
                     "",
                 ]
@@ -833,6 +1092,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(use_vae=True)
     parser.add_argument("--vae-encode-val", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--dewo-version",
+        default="v9.1",
+        choices=("v9", "v9.1"),
+        help="v9.1 = D0 expert+collect, scan crops, no stitch. v9 = full-horizon stitch.",
+    )
     return parser
 
 
@@ -951,11 +1216,14 @@ def _step_paths(args: argparse.Namespace, step: int, raw: Path) -> dict[str, Pat
         scan_root = layout["collect_dir"] / "recoverability_pairs_v2"
     else:
         scan_root = step_dir / "recoverability_pairs"
+    d0_scan_root = step_dir / "d0_collect_recoverability"
     pair_out = args.pair_dataset or (step_dir / "pair_lerobot")
     return {
         "step_dir": step_dir,
         "raw": raw,
         "scan_root": scan_root,
+        "d0_scan_root": d0_scan_root,
+        "d0_value_index": step_dir / "d0_collect_value_index.json",
         "pair_out": pair_out,
         "critic": step_dir / "v9_critic_index.json",
     }
@@ -971,12 +1239,36 @@ def prepare_step(args: argparse.Namespace, step: int, raw: Path) -> dict[str, An
 
     if "scan" in phases:
         run_scan(raw=paths["raw"], scan_root=paths["scan_root"], args=args, step=step)
-    elif not scan_is_complete(paths["scan_root"]):
+        run_result_videos(
+            scan_root=paths["scan_root"],
+            raw=paths["raw"],
+            output_dir=args.output_dir / "result",
+            overwrite=args.overwrite,
+        )
+    elif bool(phases & {"critic", "materialize", "eve"}) and not scan_is_complete(
+        paths["scan_root"]
+    ):
         raise RuntimeError(
             f"Phase list skipped scan but {paths['scan_root']} is incomplete"
         )
 
+    if "scan_d0" in phases:
+        run_scan_d0(
+            raw=paths["raw"],
+            scan_root=paths["d0_scan_root"],
+            value_index=paths["d0_value_index"],
+            args=args,
+            step=step,
+        )
+    elif (
+        bool(phases & {"eve"})
+        and paths["d0_value_index"].is_file() is False
+        and scan_d0_is_complete(paths["d0_scan_root"])
+    ):
+        write_d0_value_index(paths["d0_scan_root"], paths["d0_value_index"])
+
     critic_path = paths["critic"]
+    later_needs_pool = bool(phases & {"materialize", "eve"})
     if "critic" in phases:
         critic_path = run_critic(
             collect_dir=args.collect_dir,
@@ -987,7 +1279,7 @@ def prepare_step(args: argparse.Namespace, step: int, raw: Path) -> dict[str, An
             step=step,
             task_name=str(args.task_name),
         )
-    elif not critic_path.is_file():
+    elif later_needs_pool and not critic_path.is_file():
         existing = _find_existing_critic(args.collect_dir, step_dir)
         if existing is None:
             raise RuntimeError(f"Phase list skipped critic but no index at {critic_path}")
@@ -1001,8 +1293,9 @@ def prepare_step(args: argparse.Namespace, step: int, raw: Path) -> dict[str, An
             success_prompt=args.success_prompt,
             overwrite=args.overwrite,
             step=step,
+            dewo_version=str(args.dewo_version),
         )
-    elif not (paths["pair_out"] / "pair_index.json").is_file():
+    elif "eve" in phases and not pool_index_path(paths["pair_out"], args.dewo_version).is_file():
         raise RuntimeError(f"Phase list skipped materialize but missing {paths['pair_out']}")
 
     if "eve" in phases:
@@ -1020,24 +1313,44 @@ def prepare_step(args: argparse.Namespace, step: int, raw: Path) -> dict[str, An
     scan_summary = {}
     if (paths["scan_root"] / "summary.json").is_file():
         scan_summary = _read_json(paths["scan_root"] / "summary.json")
+    d0_scan_summary = {}
+    if (paths["d0_scan_root"] / "summary.json").is_file():
+        d0_scan_summary = _read_json(paths["d0_scan_root"] / "summary.json")
     pair_index = {}
-    pair_index_path = paths["pair_out"] / "pair_index.json"
+    pair_index_path = pool_index_path(paths["pair_out"], args.dewo_version)
     if pair_index_path.is_file():
         pair_index = _read_json(pair_index_path)
+    pool_counts = pair_index.get("counts") or {}
     summary = {
         "checkpoint_step": int(step),
+        "dewo_version": str(args.dewo_version),
         "rollout_raw": str(paths["raw"]),
         "scan_root": str(paths["scan_root"]),
-        "critic_index": str(critic_path),
+        "d0_scan_root": str(paths["d0_scan_root"]),
+        "d0_value_index": str(paths["d0_value_index"])
+        if paths["d0_value_index"].is_file()
+        else None,
+        "critic_index": str(critic_path) if Path(critic_path).is_file() else None,
         "pair_dataset": str(paths["pair_out"]),
         "env_file": str(env_file) if env_file else None,
         "num_complete_event_pairs": int(scan_summary.get("num_complete_event_pairs") or 0),
+        "num_d0_prefix_results": int(d0_scan_summary.get("num_prefix_results") or 0),
+        "num_d0_success_episodes": int(
+            d0_scan_summary.get("num_selected_success_episodes") or 0
+        ),
         "num_pair_episodes": int(pair_index.get("num_pairs") or 0) * 2,
         "num_pairs": int(pair_index.get("num_pairs") or 0),
+        "v91_d_scan": int(pool_counts.get("d_scan") or 0),
+        "v91_d_fail": int(pool_counts.get("d_fail") or 0),
+        "v91_dplus": int(pool_counts.get("dplus") or 0),
         "checkpoint_wall_seconds": time.perf_counter() - started,
         "completed_at": _utc_now(),
     }
-    eval_entry._write_json(step_dir / "summary.json", summary)
+    scan_d0_only = list(args.phases) == ["scan_d0"]
+    if scan_d0_only:
+        eval_entry._write_json(step_dir / "d0_collect_scan_summary.json", summary)
+    else:
+        eval_entry._write_json(step_dir / "summary.json", summary)
     return summary
 
 
@@ -1046,7 +1359,10 @@ def main() -> None:
     args = _resolve_args(build_parser().parse_args())
     _validate_args(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    eval_entry._install_file_logging(args.output_dir / "logs" / "orchestrator.log")
+    scan_d0_only = list(args.phases) == ["scan_d0"]
+    existing_config = args.output_dir / "prepare_config.json"
+    log_name = "scan_d0_orchestrator.log" if scan_d0_only else "orchestrator.log"
+    eval_entry._install_file_logging(args.output_dir / "logs" / log_name)
 
     layout = args._layout
     config_payload = {
@@ -1058,12 +1374,17 @@ def main() -> None:
         {
             "layout": layout["layout"],
             "started_at": _utc_now(),
-            "hydra_task": HYDRA_TASK,
+            "hydra_task": prepare_hydra_task(args.dewo_version),
             "primary_kind": PRIMARY_KIND,
             "model_config": str(args.model_config),
         }
     )
-    eval_entry._write_json(args.output_dir / "prepare_config.json", config_payload)
+    config_path = (
+        args.output_dir / "scan_d0_config.json"
+        if scan_d0_only and existing_config.is_file()
+        else args.output_dir / "prepare_config.json"
+    )
+    eval_entry._write_json(config_path, config_payload)
     print(f"Prepare output: {args.output_dir}", flush=True)
     print(f"  collect: {args.collect_dir} ({layout['layout']})", flush=True)
     print(f"  logs:    {args.output_dir / 'logs'}", flush=True)
@@ -1074,10 +1395,18 @@ def main() -> None:
         print(f"[step {step}] rollout_raw={raw}", flush=True)
         summary = prepare_step(args, step, raw)
         summaries.append(summary)
-        eval_entry._write_json(args.output_dir / "summary.json", summaries)
-        _write_results_md(args.output_dir, summaries, config_payload)
+        if scan_d0_only:
+            eval_entry._write_json(args.output_dir / "scan_d0_summary.json", summaries)
+        else:
+            eval_entry._write_json(args.output_dir / "summary.json", summaries)
+            _write_results_md(args.output_dir, summaries, config_payload)
         print(
-            f"[step {step}] pairs={summary['num_pairs']} env={summary['env_file']}",
+            f"[step {step}] pairs={summary['num_pairs']} env={summary['env_file']}"
+            + (
+                f" d0_prefixes={summary.get('num_d0_prefix_results')}"
+                if scan_d0_only
+                else ""
+            ),
             flush=True,
         )
         if args.queue_file is not None and summary.get("env_file"):
@@ -1093,7 +1422,10 @@ def main() -> None:
                 },
             )
 
-    print(f"Complete: {args.output_dir / 'RESULTS.md'}", flush=True)
+    if scan_d0_only:
+        print(f"Complete: {args.output_dir / 'scan_d0_summary.json'}", flush=True)
+    else:
+        print(f"Complete: {args.output_dir / 'RESULTS.md'}", flush=True)
 
 
 if __name__ == "__main__":

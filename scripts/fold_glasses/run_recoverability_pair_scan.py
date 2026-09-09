@@ -80,12 +80,29 @@ def merge_shards(output: Path, world: int) -> None:
     write_jsonl(output / "prefix_results.jsonl", prefixes)
     write_jsonl(output / "event_pair_manifest.jsonl", pairs)
     payload = {
-        "format": "FoldGlassesFailureRecoverabilityFrontierScan",
+        "format": next(
+            (
+                row.get("format")
+                for row in summaries
+                if row.get("format")
+            ),
+            "FoldGlassesFailureRecoverabilityFrontierScan",
+        ),
         "status": "complete",
+        "scan_mode": next(
+            (row.get("scan_mode") for row in summaries if row.get("scan_mode")),
+            "failure",
+        ),
         "num_shards": world,
         "num_prefix_results": len(prefixes),
         "num_complete_event_pairs": sum(
             row.get("status") == "complete" for row in pairs
+        ),
+        "num_selected_success_episodes": sum(
+            int(row.get("num_selected_success_episodes") or 0) for row in summaries
+        ),
+        "num_selected_failure_episodes": sum(
+            int(row.get("num_selected_failure_episodes") or 0) for row in summaries
         ),
         "shards": summaries,
     }

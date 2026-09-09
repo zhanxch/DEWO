@@ -18,6 +18,7 @@ from scripts.collect_dexjoco_rollouts import read_json, write_json  # noqa: E402
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 from dewo_v2.tasks import is_train_success, train_success_cap  # noqa: E402
+from dewo_v2.v91_pool import build_v91_pool_specs  # noqa: E402
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -149,9 +150,12 @@ def build_index(
                 "prefix_frame": int(r["prefix_frame"]),
                 "success_count": int(r["success_count"]),
                 "success_rate": float(r["success_rate"]),
-                "pass_m": int(r.get("pass_m") or 4),
+                "pass_m": int(r.get("pass_m") or 10),
                 "training_eligible": bool(r.get("training_eligible")),
                 "trajectory_ledgers": r.get("trajectory_ledgers"),
+                "successful_replicate_indices": [
+                    int(i) for i in (r.get("successful_replicate_indices") or [])
+                ],
             }
         )
 
@@ -177,6 +181,12 @@ def build_index(
         s = sorted(values)
         return {"min": s[0], "median": s[len(s) // 2], "max": s[-1]}
 
+    v91_pool = build_v91_pool_specs(
+        scan_root=scan_root,
+        episodes=episodes,
+        prefix_labels=prefix_labels,
+    )
+
     return {
         "format": "v9_critic_index_v0",
         "note": (
@@ -197,6 +207,9 @@ def build_index(
             "unique_failures_scanned": len(by_ep),
             "complete_recoverability_pairs": len(pair_rows),
             "failures_never_recoverable_in_scan": len(never_recoverable),
+            "v91_d_scan": v91_pool["counts"]["d_scan"],
+            "v91_d_fail": v91_pool["counts"]["d_fail"],
+            "v91_dplus": v91_pool["counts"]["dplus"],
         },
         "length_stats": {
             "d0_success_len": _stats([x["length"] for x in d0]),
@@ -216,6 +229,7 @@ def build_index(
         "pass_at_m_prefix_labels": prefix_labels,
         "full_horizon_pairs": pair_rows,
         "never_recoverable_failures": never_recoverable,
+        "v91_pool": v91_pool,
     }
 
 
@@ -273,10 +287,15 @@ def main(argv: list[str] | None = None) -> int:
         raw / "meta" / "episode_outcomes.jsonl",
         raw / "meta" / "episodes.jsonl",
         scan_root / "prefix_results.jsonl",
-        scan_root / "event_pair_manifest.jsonl",
     ):
         if not required.exists():
             raise SystemExit(f"Missing required input: {required}")
+    pair_manifest = scan_root / "event_pair_manifest.jsonl"
+    if not pair_manifest.exists():
+        print(
+            f"warning: {pair_manifest} missing; v9.1 pool only needs prefix_results.jsonl",
+            flush=True,
+        )
 
     index = build_index(
         collect_root,
@@ -287,8 +306,8 @@ def main(argv: list[str] | None = None) -> int:
     write_json(output, index)
     print(f"wrote {output}")
     print(json.dumps(index["counts"], indent=2))
-    if not index["full_horizon_pairs"]:
-        raise SystemExit("No complete full_horizon_pairs; scan may be incomplete.")
+    if not index.get("v91_pool", {}).get("scan_windows"):
+        raise SystemExit("No v9.1 scan windows; prefix_results.jsonl may be empty.")
     return 0
 
 

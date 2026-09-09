@@ -18,6 +18,11 @@ an open-loop replay of recorded actions.
 
 The scanner **stops at the first 0/M cliff**; later recovery islands are not
 scanned. Original S0 success rollouts are not used as pair training data.
+
+``--selection d0_collect`` scans the D0 collect successes (one train-eligible
+success per 4/4 env-success seed) for Pass@M value labels. That mode does not
+stop at a 0/M cliff, does not materialize D+/event pairs, and by default skips
+continuation RGB (metrics only).
 """
 
 from __future__ import annotations
@@ -50,8 +55,9 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for _path in (ROOT, ROOT / "scripts"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 OPEN = Path(
     os.environ.get(
@@ -100,6 +106,9 @@ from scripts.fold_glasses.validate_factual_replay import (
 
 
 FORMAT_VERSION = "2.0"
+D0_WINDOW_SPAN = 33
+SELECTION_FAILURE = "failure"
+SELECTION_D0_COLLECT = "d0_collect"
 DEFAULT_HARD_TRANSFER_SEEDS: tuple[int, ...] = ()
 SUCCESS_EVENT_SOURCE = "cropped_from_saved_success_rollout"
 NOISE_SCHEME = (
@@ -253,6 +262,107 @@ def select_one_failure_per_seed(
     return selected, audit
 
 
+def select_d0_collect_successes(
+    attempts: Sequence[Mapping[str, Any]],
+    *,
+    task_name: str,
+    preferred_episode_indices: set[int] | None = None,
+    seed_filter: set[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select the same D0 collect successes used by prepare (one per 4/4 seed)."""
+
+    from dewo_v2.select_success_rollout_primary import select_one_per_all_success_seed
+
+    complete = [dict(raw) for raw in attempts if _complete_attempt(raw)]
+    outcomes: list[dict[str, Any]] = []
+    lengths: dict[int, int] = {}
+    by_ep: dict[int, dict[str, Any]] = {}
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in complete:
+        ep = int(row["saved_episode_index"])
+        by_ep[ep] = row
+        grouped[int(row["seed"])].append(row)
+        lengths[ep] = int(row.get("steps") or row.get("length") or 0)
+        outcomes.append(
+            {
+                "episode_index": ep,
+                "seed": int(row["seed"]),
+                "success": bool(row["success"]),
+                "repeat": int(row.get("repeat", 0)),
+                "attempt_index": int(row.get("attempt_index", row.get("repeat", 0))),
+            }
+        )
+    try:
+        primary, _leftover, _excluded = select_one_per_all_success_seed(
+            outcomes=outcomes,
+            lengths=lengths,
+            task_name=task_name,
+        )
+    except SystemExit as exc:
+        raise ValueError("No 4/4 all-success seeds found for D0 collect scan") from exc
+
+    primary_by_seed = {int(row["seed"]): row for row in primary}
+    selected: list[dict[str, Any]] = []
+    audit: list[dict[str, Any]] = []
+    for seed in sorted(grouped):
+        rows = grouped[seed]
+        successes = [row for row in rows if bool(row["success"])]
+        failures = [row for row in rows if not bool(row["success"])]
+        if successes and failures:
+            classification = "mixed"
+        elif successes:
+            classification = "all_success"
+        else:
+            classification = "all_failure"
+
+        reason = "not_all_success"
+        chosen: dict[str, Any] | None = None
+        candidate = primary_by_seed.get(seed)
+        if seed_filter is not None and seed not in seed_filter:
+            reason = "seed_not_requested"
+        elif candidate is None:
+            reason = "not_all_success"
+        elif (
+            preferred_episode_indices is not None
+            and int(candidate["episode_index"]) not in preferred_episode_indices
+        ):
+            reason = "no_requested_success_episode"
+        else:
+            reason = "selected"
+            chosen = {
+                **by_ep[int(candidate["episode_index"])],
+                "seed_classification": "all_success",
+                "training_eligible": True,
+                "evaluation_only": False,
+            }
+            selected.append(chosen)
+
+        audit.append(
+            {
+                "seed": seed,
+                "classification": classification,
+                "success_episode_indices": [
+                    int(row["saved_episode_index"]) for row in successes
+                ],
+                "failure_episode_indices": [
+                    int(row["saved_episode_index"]) for row in failures
+                ],
+                "selected_success_episode_index": (
+                    None if chosen is None else int(chosen["saved_episode_index"])
+                ),
+                "training_eligible": bool(
+                    chosen is not None and chosen["training_eligible"]
+                ),
+                "evaluation_only": bool(
+                    chosen is not None and chosen["evaluation_only"]
+                ),
+                "selection_reason": reason,
+            }
+        )
+    selected.sort(key=lambda row: (int(row["seed"]), int(row["saved_episode_index"])))
+    return selected, audit
+
+
 def recorded_horizon(
     actions: Sequence[Any],
     recorded_states: Sequence[Any],
@@ -267,8 +377,28 @@ def recorded_horizon(
     return min(int(max_steps), n)
 
 
-def clip_scan_frames(frames: Sequence[int], *, horizon: int) -> list[int]:
-    return [int(frame) for frame in frames if 0 <= int(frame) < int(horizon)]
+def clip_scan_frames(
+    frames: Sequence[int],
+    *,
+    horizon: int,
+    window_span: int = 0,
+) -> list[int]:
+    """Keep replan-aligned prefixes that fit in the recorded episode.
+
+    ``window_span`` (Eve crop length, default unused) also requires
+    ``frame + window_span <= horizon`` so a labeled D0 window is full.
+    """
+
+    kept: list[int] = []
+    limit = int(horizon)
+    for frame in frames:
+        value = int(frame)
+        if not 0 <= value < limit:
+            continue
+        if int(window_span) > 0 and value + int(window_span) > limit:
+            continue
+        kept.append(value)
+    return kept
 
 
 def validate_scan_frames(
@@ -784,13 +914,44 @@ def ordered_success_candidates(
     return selected
 
 
+def signatures_compatible(
+    cached: Mapping[str, Any] | None, current: Mapping[str, Any]
+) -> bool:
+    """Match the fields that define a replay. Extra keys (selection, etc.) are ignored."""
+
+    if not isinstance(cached, Mapping):
+        return False
+    for key in (
+        "format_version",
+        "dataset",
+        "collection_summary",
+        "checkpoint",
+        "model_config",
+        "dataset_stats",
+        "text_embedding",
+        "task_name",
+        "action_horizon",
+        "replan_steps",
+        "num_inference_steps",
+        "max_steps",
+        "pass_m",
+        "scan_frames",
+        "base_noise_seed",
+        "noise_scheme",
+        "event_expansion_blocks",
+    ):
+        if cached.get(key) != current.get(key):
+            return False
+    return cached.get("selection", "failure") == current.get("selection", "failure")
+
+
 def _compatible_cached_trajectory(
     row: Mapping[str, Any], *, run_signature: Mapping[str, Any], replicate_index: int
 ) -> bool:
     return bool(
         row.get("status") == "complete"
         and int(row.get("replicate_index", -1)) == replicate_index
-        and row.get("run_signature") == run_signature
+        and signatures_compatible(row.get("run_signature"), run_signature)
     )
 
 
@@ -808,6 +969,7 @@ def scan_prefix(
     output: Path,
     run_signature: Mapping[str, Any],
     overwrite: bool,
+    save_continuation_videos: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     episode_index = int(attempt["saved_episode_index"])
     prefix_dir = output / "prefixes" / f"ep{episode_index:06d}_f{prefix_frame:04d}"
@@ -829,7 +991,9 @@ def scan_prefix(
             artifact = cached.get("trajectory_arrays")
             if not artifact or not Path(artifact).is_file():
                 raise RuntimeError(f"Cached trajectory artifact is missing: {row_path}")
-            if saved_success_rollout_videos_complete(cached):
+            if (not save_continuation_videos) or saved_success_rollout_videos_complete(
+                cached
+            ):
                 trajectory_rows.append(dict(cached))
                 used_cache = True
             else:
@@ -849,12 +1013,16 @@ def scan_prefix(
                 replicate_index=replicate_index,
                 base_noise_seed=base_noise_seed,
                 max_steps=max_steps,
-                capture_window=(prefix_frame, max_steps),
+                capture_window=(
+                    (prefix_frame, max_steps) if save_continuation_videos else None
+                ),
             )
             artifact = replicate_dir / "trajectory.npz"
             save_trajectory_arrays(artifact, result)
-            video_meta = save_success_rollout_videos(
-                replicate_dir, result, fps=fps
+            video_meta = (
+                save_success_rollout_videos(replicate_dir, result, fps=fps)
+                if save_continuation_videos
+                else {}
             )
             row = {
                 **_trajectory_public_row(result),
@@ -864,6 +1032,7 @@ def scan_prefix(
                 "status": "complete",
                 "seed": int(attempt["seed"]),
                 "source_repeat": int(attempt["repeat"]),
+                "source_episode_index": episode_index,
                 "source_failure_episode_index": episode_index,
                 "trajectory_arrays": str(artifact.resolve()),
                 "run_signature": dict(run_signature),
@@ -882,6 +1051,7 @@ def scan_prefix(
         "seed": int(attempt["seed"]),
         "seed_classification": str(attempt["seed_classification"]),
         "training_eligible": bool(attempt["training_eligible"]),
+        "source_episode_index": episode_index,
         "source_failure_episode_index": episode_index,
         "source_repeat": int(attempt["repeat"]),
         "prefix_frame": int(prefix_frame),
@@ -1154,7 +1324,7 @@ def materialize_frontier_pair(
         )
     if pair_path.exists() and not overwrite:
         cached = read_json(pair_path)
-        if cached.get("run_signature") != run_signature:
+        if not signatures_compatible(cached.get("run_signature"), run_signature):
             raise RuntimeError(f"Cached pair is incompatible with this run: {pair_path}")
         if (
             cached.get("status") == "complete"
@@ -1413,6 +1583,11 @@ def run_episode_scan(
     run_signature: Mapping[str, Any],
     overwrite: bool,
     task_name: str = "fold_glasses",
+    require_success: bool = False,
+    stop_on_cliff: bool = True,
+    skip_event_pairs: bool = False,
+    save_continuation_videos: bool = True,
+    window_span: int = 0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     episode_index = int(attempt["saved_episode_index"])
     canonical_attempt = attempt_for_episode(dataset, episode_index)
@@ -1421,11 +1596,16 @@ def run_episode_scan(
             raise ValueError(
                 f"Collection-summary mismatch for episode {episode_index}: {key}"
             )
-    if bool(canonical_attempt["success"]):
+    if require_success:
+        if not bool(canonical_attempt["success"]):
+            raise ValueError(f"Episode {episode_index} is not a success")
+    elif bool(canonical_attempt["success"]):
         raise ValueError(f"Episode {episode_index} is not a failure")
     actions, recorded_states = load_episode(dataset, episode_index)
     horizon = recorded_horizon(actions, recorded_states, max_steps=max_steps)
-    episode_frames = clip_scan_frames(scan_frames, horizon=horizon)
+    episode_frames = clip_scan_frames(
+        scan_frames, horizon=horizon, window_span=window_span
+    )
     episode_dir = output / "episodes" / f"ep{episode_index:06d}"
     if not episode_frames:
         episode_summary = {
@@ -1434,6 +1614,7 @@ def run_episode_scan(
             "status": "skipped_short_episode",
             "seed": int(attempt["seed"]),
             "seed_classification": str(attempt["seed_classification"]),
+            "source_episode_index": episode_index,
             "source_failure_episode_index": episode_index,
             "recorded_steps": horizon,
             "max_steps": int(max_steps),
@@ -1478,6 +1659,7 @@ def run_episode_scan(
                 output=output,
                 run_signature=run_signature,
                 overwrite=overwrite,
+                save_continuation_videos=save_continuation_videos,
             )
             prefix_rows.append(prefix)
             trajectory_rows.extend(trajectories)
@@ -1486,59 +1668,63 @@ def run_episode_scan(
                     f"[episode {episode_index}] first 0/{pass_m} at prefix={prefix_frame}",
                     flush=True,
                 )
-                break
+                if stop_on_cliff:
+                    break
 
-        frontiers = find_recoverability_frontiers(
-            prefix_rows,
-            block_size=int(policy.replan_steps),
-            expansion_blocks=event_expansion_blocks,
-            max_steps=max_steps,
-        )
         pair_rows: list[dict[str, Any]] = []
-        for frontier in frontiers:
-            recoverable = int(frontier["last_recoverable_frame"])
-            if not training_pair_eligible(attempt, frontier, pass_m=pass_m):
+        frontiers: list[dict[str, Any]] = []
+        if not skip_event_pairs:
+            frontiers = find_recoverability_frontiers(
+                prefix_rows,
+                block_size=int(policy.replan_steps),
+                expansion_blocks=event_expansion_blocks,
+                max_steps=max_steps,
+            )
+            for frontier in frontiers:
+                recoverable = int(frontier["last_recoverable_frame"])
+                if not training_pair_eligible(attempt, frontier, pass_m=pass_m):
+                    pair_rows.append(
+                        {
+                            "format": "FoldGlassesRecoverabilityEventPair",
+                            "version": FORMAT_VERSION,
+                            "status": "training_ineligible_prefix",
+                            "seed": int(attempt["seed"]),
+                            "source_episode_index": episode_index,
+                            "source_failure_episode_index": episode_index,
+                            "frontier": dict(frontier),
+                            "training_eligible": False,
+                            "evaluation_only": True,
+                            "reason": "short_or_censored_event_window",
+                            "run_signature": dict(run_signature),
+                        }
+                    )
+                    continue
+                candidates = ordered_success_candidates(
+                    trajectory_rows, prefix_frame=recoverable
+                )
+                if not candidates:
+                    raise RuntimeError(
+                        f"Frontier {frontier['frontier_id']} has no saved success replicate"
+                    )
                 pair_rows.append(
-                    {
-                        "format": "FoldGlassesRecoverabilityEventPair",
-                        "version": FORMAT_VERSION,
-                        "status": "training_ineligible_prefix",
-                        "seed": int(attempt["seed"]),
-                        "source_failure_episode_index": episode_index,
-                        "frontier": dict(frontier),
-                        "training_eligible": False,
-                        "evaluation_only": True,
-                        "reason": "short_or_censored_event_window",
-                        "run_signature": dict(run_signature),
-                    }
+                    materialize_frontier_pair(
+                        env,
+                        policy,
+                        dataset=dataset,
+                        actions=actions,
+                        recorded_states=recorded_states,
+                        snapshot=snapshots[recoverable],
+                        attempt=attempt,
+                        frontier=frontier,
+                        successful_trajectories=candidates,
+                        base_noise_seed=base_noise_seed,
+                        max_steps=max_steps,
+                        fps=fps,
+                        output=output,
+                        run_signature=run_signature,
+                        overwrite=overwrite,
+                    )
                 )
-                continue
-            candidates = ordered_success_candidates(
-                trajectory_rows, prefix_frame=recoverable
-            )
-            if not candidates:
-                raise RuntimeError(
-                    f"Frontier {frontier['frontier_id']} has no saved success replicate"
-                )
-            pair_rows.append(
-                materialize_frontier_pair(
-                    env,
-                    policy,
-                    dataset=dataset,
-                    actions=actions,
-                    recorded_states=recorded_states,
-                    snapshot=snapshots[recoverable],
-                    attempt=attempt,
-                    frontier=frontier,
-                    successful_trajectories=candidates,
-                    base_noise_seed=base_noise_seed,
-                    max_steps=max_steps,
-                    fps=fps,
-                    output=output,
-                    run_signature=run_signature,
-                    overwrite=overwrite,
-                )
-            )
 
         episode_summary = {
             "format": "FoldGlassesRecoverabilityEpisodeScan",
@@ -1546,6 +1732,7 @@ def run_episode_scan(
             "seed": int(attempt["seed"]),
             "seed_classification": str(attempt["seed_classification"]),
             "training_eligible": bool(attempt["training_eligible"]),
+            "source_episode_index": episode_index,
             "source_failure_episode_index": episode_index,
             "source_repeat": int(attempt["repeat"]),
             "num_scan_points": len(prefix_rows),
@@ -1609,6 +1796,41 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-name", default="fold_glasses")
     parser.add_argument("--skip-pin-check", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--selection",
+        choices=(SELECTION_FAILURE, SELECTION_D0_COLLECT),
+        default=SELECTION_FAILURE,
+        help="failure = one failed rollout per seed (pairs). "
+        "d0_collect = D0 collect successes for Pass@M value labels.",
+    )
+    parser.add_argument(
+        "--stop-on-cliff",
+        dest="stop_on_cliff",
+        action="store_true",
+        default=None,
+        help="Stop an episode at the first 0/M prefix. Default on for failure.",
+    )
+    parser.add_argument(
+        "--no-stop-on-cliff",
+        dest="stop_on_cliff",
+        action="store_false",
+        help="Scan every grid prefix through the episode horizon.",
+    )
+    parser.add_argument(
+        "--skip-event-pairs",
+        action="store_true",
+        help="Record Pass@M prefixes only; do not materialize D+/event pairs.",
+    )
+    parser.add_argument(
+        "--metrics-only",
+        action="store_true",
+        help="Skip continuation RGB videos. Implied by --selection d0_collect.",
+    )
+    parser.add_argument(
+        "--save-continuation-videos",
+        action="store_true",
+        help="Force continuation RGB even in d0_collect mode.",
+    )
     parser.add_argument("--shard-rank", type=int, default=0)
     parser.add_argument("--shard-world", type=int, default=1)
     return parser.parse_args(argv)
@@ -1643,15 +1865,35 @@ def main(argv: Iterable[str] | None = None) -> int:
     preferred = set(parse_ints(args.episode_indices)) or None
     seed_filter = set(parse_ints(args.seeds)) or None
     hard_transfer = set(parse_ints(args.hard_transfer_seeds))
-    selected, selection_audit = select_one_failure_per_seed(
-        collection.get("attempt_log", []),
-        preferred_episode_indices=preferred,
-        seed_filter=seed_filter,
-        hard_transfer_seeds=hard_transfer,
+    selection = str(args.selection)
+    d0_mode = selection == SELECTION_D0_COLLECT
+    stop_on_cliff = (
+        (not d0_mode) if args.stop_on_cliff is None else bool(args.stop_on_cliff)
     )
+    skip_event_pairs = bool(args.skip_event_pairs) or d0_mode
+    save_continuation_videos = (
+        True if args.save_continuation_videos else (not d0_mode and not args.metrics_only)
+    )
+    window_span = D0_WINDOW_SPAN if d0_mode else 0
+    if d0_mode:
+        selected, selection_audit = select_d0_collect_successes(
+            collection.get("attempt_log", []),
+            task_name=str(args.task_name),
+            preferred_episode_indices=preferred,
+            seed_filter=seed_filter,
+        )
+        empty_message = "No D0 collect success episodes were selected"
+    else:
+        selected, selection_audit = select_one_failure_per_seed(
+            collection.get("attempt_log", []),
+            preferred_episode_indices=preferred,
+            seed_filter=seed_filter,
+            hard_transfer_seeds=hard_transfer,
+        )
+        empty_message = "No eligible failure episodes were selected"
     atomic_write_jsonl(output / "seed_selection.jsonl", selection_audit)
     if not selected:
-        raise ValueError("No eligible failure episodes were selected")
+        raise ValueError(empty_message)
     shard_world = int(args.shard_world)
     shard_rank = int(args.shard_rank)
     if shard_world < 1 or not 0 <= shard_rank < shard_world:
@@ -1662,20 +1904,27 @@ def main(argv: Iterable[str] | None = None) -> int:
         selected = selected[shard_rank::shard_world]
         print(
             f"shard {shard_rank}/{shard_world}: "
-            f"{len(selected)} failure episodes",
+            f"{len(selected)} {selection} episodes",
             flush=True,
         )
         if not selected:
             atomic_write_json(
                 output / "summary.json",
                 {
-                    "format": "FoldGlassesFailureRecoverabilityFrontierScan",
+                    "format": (
+                        "D0CollectRecoverabilityScan"
+                        if d0_mode
+                        else "FoldGlassesFailureRecoverabilityFrontierScan"
+                    ),
                     "version": FORMAT_VERSION,
                     "status": "complete",
+                    "scan_mode": selection,
                     "shard_rank": shard_rank,
                     "shard_world": shard_world,
                     "num_selected_failure_episodes": 0,
+                    "num_selected_success_episodes": 0,
                     "num_complete_event_pairs": 0,
+                    "num_prefix_results": 0,
                 },
             )
             return 0
@@ -1699,6 +1948,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         "max_steps": int(args.max_steps),
         "pass_m": int(args.pass_m),
         "scan_frames": scan_frames,
+        "selection": selection,
+        "stop_on_cliff": bool(stop_on_cliff),
+        "skip_event_pairs": bool(skip_event_pairs),
+        "save_continuation_videos": bool(save_continuation_videos),
+        "window_span": int(window_span),
         "base_noise_seed": int(args.base_noise_seed),
         "noise_scheme": NOISE_SCHEME,
         "event_expansion_blocks": int(args.event_expansion_blocks),
@@ -1707,6 +1961,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         output / "config.json",
         {
             **run_signature,
+            "selected_episodes": [
+                int(row["saved_episode_index"]) for row in selected
+            ],
             "selected_failure_episodes": [
                 int(row["saved_episode_index"]) for row in selected
             ],
@@ -1771,6 +2028,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             run_signature=run_signature,
             overwrite=bool(args.overwrite),
             task_name=str(args.task_name),
+            require_success=d0_mode,
+            stop_on_cliff=stop_on_cliff,
+            skip_event_pairs=skip_event_pairs,
+            save_continuation_videos=save_continuation_videos,
+            window_span=window_span,
         )
         all_prefix_rows.extend(prefix_rows)
         all_pair_rows.extend(pair_rows)
@@ -1779,11 +2041,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         atomic_write_jsonl(output / "event_pair_manifest.jsonl", all_pair_rows)
 
     summary = {
-        "format": "FoldGlassesFailureRecoverabilityFrontierScan",
+        "format": (
+            "D0CollectRecoverabilityScan"
+            if d0_mode
+            else "FoldGlassesFailureRecoverabilityFrontierScan"
+        ),
         "version": FORMAT_VERSION,
         "status": "complete",
+        "scan_mode": selection,
         "dataset": str(dataset),
-        "num_selected_failure_episodes": len(selected),
+        "num_selected_failure_episodes": 0 if d0_mode else len(selected),
+        "num_selected_success_episodes": len(selected) if d0_mode else 0,
         "num_mixed_seed_episodes": sum(
             row["seed_classification"] == "mixed" for row in selected
         ),
@@ -1801,6 +2069,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             row.get("status") == "complete" and bool(row.get("training_eligible"))
             for row in all_pair_rows
         ),
+        "stop_on_cliff": bool(stop_on_cliff),
+        "skip_event_pairs": bool(skip_event_pairs),
+        "save_continuation_videos": bool(save_continuation_videos),
         "seed_selection": str((output / "seed_selection.jsonl").resolve()),
         "prefix_results": str((output / "prefix_results.jsonl").resolve()),
         "event_pair_manifest": str(

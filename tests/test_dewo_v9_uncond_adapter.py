@@ -316,6 +316,28 @@ class DewoV9UncondAdapterTests(unittest.TestCase):
         self.assertAlmostEqual(g_end, 1.0)
         self.assertEqual(dataset._v9_value_target(failure, 0, gamma=0.99), 0.0)
 
+    def test_v91_value_is_k_over_ten(self) -> None:
+        dataset = EveManifestRobotVideoDataset.__new__(EveManifestRobotVideoDataset)
+        dataset.unit_filter = "dewo_scratch_pool"
+        scan = {
+            "pool_role": "d_scan",
+            "sample_type": "event",
+            "success_count": 4,
+            "pass_m": 10,
+            "value_target": 0.4,
+            "value_loss_weight": 1.0,
+            "end_frame": 33,
+        }
+        d0 = {
+            "pool_role": "d0",
+            "sample_type": "episode",
+            "episode_outcome": "success",
+            "batch_role": "primary",
+            "end_frame": 250,
+        }
+        self.assertAlmostEqual(dataset._v9_value_target(scan, 0, gamma=0.99), 0.4)
+        self.assertEqual(dataset._v91_value_target(d0), (0.0, 0.0))
+
     def test_fail_cliff_does_not_eat_shared_prefix(self) -> None:
         lo, hi = fail_cliff_span(72, 96, 198, min_len=33, post=24)
         self.assertEqual(lo, 72)

@@ -20,7 +20,7 @@
 # D_fail = fail cliff [t, M+24). G_t=γ^{T-t} (fail=0). No FAST.
 # CFG: D+ 0.9/0/0.1, D_fail 1.0/0/0, suffixes Successful / Failed execution.
 #
-# Protocol .env files are paths/VAE/text-cache only. train.sh owns CFG mixing.
+# Protocol .env files are paths/VAE/text-cache only. train_dexjoco.py owns CFG mixing.
 #
 # Text embeds: base + Successful/Failed outcome. FAST is unused.
 

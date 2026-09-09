@@ -73,6 +73,7 @@ sleep 30
 
 cd "${OPENPI}"
 conda deactivate 2>/dev/null || true
+unset JAX_PLATFORMS JAX_PLATFORM_NAME
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 export HF_LEROBOT_HOME="${ROOT}/data/pi"
 export OPENPI_DATA_HOME="${ROOT}/checkpoints/openpi"

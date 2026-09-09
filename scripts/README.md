@@ -7,6 +7,7 @@
 ```text
 scripts/
 ├── train.py, train_zero1.sh, train_zero2.sh   # 通用 Hydra 训练入口
+├── train_dexjoco.py                            # DexJoCo DEWOv9 / scratch 训练（in-process CLI）
 ├── precompute_text_embeds.py                   # T5 embedding 预计算
 ├── export_text_embed_cache_npz.py              # .pt text cache → .npz（DexJoCo client 用）
 ├── run_fastwam_server_async.py                 # DexJoCo 闭环 policy server（async ZMQ）
@@ -43,16 +44,17 @@ bash scripts/train_zero1.sh 4 task=<task_name>
 
 ## DexJoCo 闭环（唯一入口）
 
-仿真闭环 **eval** / **collect** / **v9 prepare** 都走同一套 in-process 入口（无 ZMQ）：
+仿真闭环 **eval** / **collect** / **v9 prepare** / **train** 都走同一套 in-process 入口（无 ZMQ；train 再拉起 accelerate）：
 
 | 组件 | 文件 |
 |------|------|
 | Eval | `scripts/eval_dexjoco.py` |
 | Collect | `scripts/collect_dexjoco.py` → LeRobot shards + `rollout_raw` |
 | Prepare | `scripts/prepare_dexjoco.py` → scan + pair LeRobot + Eve/VAE |
+| Train | `scripts/train_dexjoco.py` → `--init s0`（v9 adapter）或 `--init scratch`（FastWAMJoint） |
 | Policy | `src/fastwam/inference/dexjoco.py` |
 
-旧的 async ZMQ orchestrator（`scripts/dexjoco_async/`、`collect_dexjoco_rollouts.py`）仍可用于历史流水线，新实验请用上面三个入口。
+旧的 async ZMQ orchestrator（`scripts/dexjoco_async/`、`collect_dexjoco_rollouts.py`）仍可用于历史流水线，新实验请用上面四个入口。
 
 ```bash
 python scripts/eval_dexjoco.py \
@@ -77,15 +79,30 @@ python scripts/prepare_dexjoco.py \
   --task-name fold_glasses \
   --collect-dir collect_results/dexjoco/fold_glasses/<stamp> \
   --gpus 1,2,3,4
+
+python scripts/train_dexjoco.py \
+  --task-name fold_glasses --init s0 \
+  --prepare-dir prepare_results/dexjoco/fold_glasses/<stamp> \
+  --gpus 1,2,3,4
 ```
 
 Collect 的 `collect_config.json` 会填上 ckpt / stats / horizon。prepare 默认写到 `prepare_results/dexjoco/<task>/<stamp>/`。训练：
 
 ```bash
-TASK=fold_glasses INIT=s0 DEWO_VERSION=v9 GPUS=1,2,3,4 \
-  ENV_FILE=prepare_results/dexjoco/fold_glasses/<stamp>/step_055000/eve_v02/protocol/offline_v1_b1_jump_fast.env \
-  bash scripts/dewo_v2/train.sh
+python scripts/train_dexjoco.py \
+  --task-name fold_glasses \
+  --init s0 \
+  --prepare-dir prepare_results/dexjoco/fold_glasses/<stamp> \
+  --gpus 1,2,3,4
+
+python scripts/train_dexjoco.py \
+  --task-name fold_glasses \
+  --init scratch \
+  --prepare-dir prepare_results/dexjoco/fold_glasses/<stamp> \
+  --gpus 1,2,3,4
 ```
+
+`bash scripts/dewo_v2/train.sh` 仍可用（会转到上面这个入口；默认开 tmux）。
 
 water_plant 一键 collect + trim + train：`bash scripts/water_plant/collect_rollout_200_trim8s_and_train.sh`
 hammer_nail 一键 collect + trim + train：`bash scripts/hammer_nail/collect_rollout_200_trim8s_and_train.sh`

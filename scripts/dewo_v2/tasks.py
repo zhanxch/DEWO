@@ -2,7 +2,7 @@
 """DexJoCo DEWO v9 task registry.
 
 Task identity (prompt, ckpt, expert path) lives here. Train CFG mixing is
-owned by ``scripts/dewo_v2/train.sh`` (D+ 0.9/0/0.1 Successful, D_fail
+owned by ``scripts/train_dexjoco.py`` (D+ 0.9/0/0.1 Successful, D_fail
 1.0/0/0 Failed, no FAST). ``export-env`` does not dump mix triples.
 
 Usage:
@@ -26,7 +26,7 @@ DEFAULT_OPEN_REPO = Path(
     os.environ.get("OPEN_REPO", str(ROOT.parent / "FastWAM-infer-in-DexJoco"))
 )
 
-# DEWO v9 CFG (train.sh is the source of truth; dump-cfg-json mirrors this).
+# DEWO v9 CFG (train_dexjoco.py is the source of truth; dump-cfg-json mirrors this).
 V9_CFG_SUCCESS_SUFFIX = " Successful execution."
 V9_CFG_FAILURE_SUFFIX: Optional[str] = " Failed execution."
 V9_CFG_DROPOUT = 0.0

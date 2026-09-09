@@ -762,6 +762,7 @@ class Wan22Trainer:
                     "action_loss_weight",
                     "video_loss_weight",
                     "value_target",
+                    "value_loss_weight",
                     "outcome_flag",
                 ):
                     tensor = sample.get(key)

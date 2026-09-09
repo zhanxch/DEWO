@@ -34,6 +34,12 @@ class ScanFrameValidationTest(unittest.TestCase):
             [48, 72, 192],
         )
         self.assertEqual(
+            frontier.clip_scan_frames(
+                [48, 72, 192, 216], horizon=198, window_span=33
+            ),
+            [48, 72],
+        )
+        self.assertEqual(
             frontier.recorded_horizon([0] * 1000, [0] * 1000, max_steps=1200),
             1000,
         )
@@ -244,6 +250,70 @@ class SeedSelectionTest(unittest.TestCase):
         self.assertEqual(by_seed[1]["selection_reason"], "all_success_excluded")
         self.assertEqual(by_seed[9]["selection_reason"], "selected")
         self.assertFalse(by_seed[10106]["evaluation_only"])
+
+    def test_select_d0_collect_successes_one_per_all_success_seed(self) -> None:
+        attempts = [
+            {"seed": 1, "repeat": 0, "success": True, "saved_episode_index": 0, "steps": 400, "attempt_index": 0},
+            {"seed": 1, "repeat": 1, "success": True, "saved_episode_index": 1, "steps": 410, "attempt_index": 1},
+            {"seed": 1, "repeat": 2, "success": True, "saved_episode_index": 2, "steps": 420, "attempt_index": 2},
+            {"seed": 1, "repeat": 3, "success": True, "saved_episode_index": 3, "steps": 430, "attempt_index": 3},
+            {"seed": 2, "repeat": 0, "success": False, "saved_episode_index": 4, "steps": 200, "attempt_index": 0},
+            {"seed": 2, "repeat": 1, "success": True, "saved_episode_index": 5, "steps": 400, "attempt_index": 1},
+            {"seed": 2, "repeat": 2, "success": True, "saved_episode_index": 6, "steps": 400, "attempt_index": 2},
+            {"seed": 2, "repeat": 3, "success": True, "saved_episode_index": 7, "steps": 400, "attempt_index": 3},
+            {"seed": 3, "repeat": 0, "success": True, "saved_episode_index": 8, "steps": 500, "attempt_index": 0},
+            {"seed": 3, "repeat": 1, "success": True, "saved_episode_index": 9, "steps": 510, "attempt_index": 1},
+            {"seed": 3, "repeat": 2, "success": True, "saved_episode_index": 10, "steps": 520, "attempt_index": 2},
+            {"seed": 3, "repeat": 3, "success": True, "saved_episode_index": 11, "steps": 530, "attempt_index": 3},
+        ]
+        selected, audit = frontier.select_d0_collect_successes(
+            attempts, task_name="fold_glasses"
+        )
+        self.assertEqual(
+            [(row["seed"], row["saved_episode_index"]) for row in selected],
+            [(1, 0), (3, 8)],
+        )
+        self.assertTrue(all(row["seed_classification"] == "all_success" for row in selected))
+        by_seed = {row["seed"]: row for row in audit}
+        self.assertEqual(by_seed[1]["selection_reason"], "selected")
+        self.assertEqual(by_seed[2]["selection_reason"], "not_all_success")
+        self.assertEqual(by_seed[3]["selected_success_episode_index"], 8)
+
+    def test_cached_failure_signature_ignores_new_selection_fields(self) -> None:
+        old = {
+            "format_version": "2.0",
+            "dataset": "/tmp/raw",
+            "collection_summary": "/tmp/raw/collection_summary.json",
+            "checkpoint": "/tmp/ckpt.pt",
+            "model_config": "/tmp/config.yaml",
+            "dataset_stats": "/tmp/stats.json",
+            "text_embedding": None,
+            "task_name": "fold_glasses",
+            "action_horizon": 32,
+            "replan_steps": 24,
+            "num_inference_steps": 10,
+            "max_steps": 1200,
+            "pass_m": 10,
+            "scan_frames": [48, 72],
+            "base_noise_seed": 20260813,
+            "noise_scheme": "blake2b64",
+            "event_expansion_blocks": 1,
+        }
+        new = {
+            **old,
+            "selection": "failure",
+            "stop_on_cliff": True,
+            "skip_event_pairs": False,
+            "save_continuation_videos": True,
+            "window_span": 0,
+        }
+        self.assertTrue(frontier.signatures_compatible(old, new))
+        self.assertFalse(
+            frontier.signatures_compatible({**old, "pass_m": 4}, new)
+        )
+        self.assertFalse(
+            frontier.signatures_compatible({**old, "selection": "d0_collect"}, new)
+        )
 
     def test_estimate_scan_cost_is_available_without_gpu(self) -> None:
         estimate = frontier.estimate_scan_cost(

@@ -71,6 +71,39 @@ class PrepareDexJocoLayoutTest(unittest.TestCase):
             )
             self.assertTrue(prepare.scan_is_complete(scan))
 
+    def test_scan_d0_complete_uses_prefix_count(self) -> None:
+        import prepare_dexjoco as prepare
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scan = Path(tmp)
+            self.assertFalse(prepare.scan_d0_is_complete(scan))
+            (scan / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "scan_mode": "d0_collect",
+                        "num_prefix_results": 0,
+                        "num_complete_event_pairs": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertFalse(prepare.scan_d0_is_complete(scan))
+            self.assertFalse(prepare.scan_is_complete(scan))
+            (scan / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "scan_mode": "d0_collect",
+                        "num_prefix_results": 12,
+                        "num_complete_event_pairs": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertTrue(prepare.scan_d0_is_complete(scan))
+            self.assertFalse(prepare.scan_is_complete(scan))
+
 
 class PrepareDexJocoCliTest(unittest.TestCase):
     def test_parser_defaults_match_collect_style(self) -> None:
@@ -87,9 +120,27 @@ class PrepareDexJocoCliTest(unittest.TestCase):
         )
         self.assertEqual(args.gpus, [1])
         self.assertEqual(args.phases, list(prepare.ALL_PHASES))
+        self.assertEqual(args.dewo_version, "v9.1")
         self.assertTrue(args.use_vae)
         self.assertFalse(args.require_existing_scan)
         self.assertEqual(args.pass_m, 10)
+
+    def test_phases_scan_d0_is_allowed(self) -> None:
+        import prepare_dexjoco as prepare
+
+        parser = prepare.build_parser()
+        args = parser.parse_args(
+            [
+                "--task-name",
+                "fold_glasses",
+                "--collect-dir",
+                "/tmp/collect",
+                "--phases",
+                "scan_d0",
+            ]
+        )
+        self.assertEqual(args.phases, ["scan_d0"])
+        self.assertIn("scan_d0", prepare.ALL_PHASES)
 
     def test_resolve_args_fills_from_collect_config(self) -> None:
         import prepare_dexjoco as prepare
@@ -142,6 +193,21 @@ class PrepareDexJocoCliTest(unittest.TestCase):
                 resolved.model_config,
                 (ROOT / "configs/eval/dexjoco/mixed_5task_fastwam_joint/config.yaml").resolve(),
             )
+
+    def test_v91_helpers(self) -> None:
+        import prepare_dexjoco as prepare
+
+        self.assertTrue(prepare.is_v91("v9.1"))
+        self.assertFalse(prepare.is_v91("v9"))
+        self.assertEqual(prepare.prepare_hydra_task("v9.1"), prepare.HYDRA_SCRATCH)
+        self.assertEqual(
+            prepare.pool_index_path(Path("/tmp/pair"), "v9.1").name,
+            "pool_index.json",
+        )
+        self.assertEqual(
+            prepare.pool_index_path(Path("/tmp/pair"), "v9").name,
+            "pair_index.json",
+        )
 
     def test_shared_flags_with_collect(self) -> None:
         import collect_dexjoco as collect

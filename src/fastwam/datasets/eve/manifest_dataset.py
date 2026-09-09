@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 
@@ -21,6 +21,29 @@ from fastwam.utils.logging_config import get_logger
 
 
 logger = get_logger(__name__)
+
+_POOL_ROLES = frozenset({"d0", "d_scan", "d_fail", "dplus"})
+
+
+def _pool_role(unit: dict[str, Any]) -> str | None:
+    role = unit.get("pool_role")
+    if role in _POOL_ROLES:
+        return str(role)
+    return None
+
+
+def _scan_value_at_frame(table: Mapping[Any, Any] | None, window_start: int) -> float | None:
+    """Exact scan-node lookup. No interpolation between labeled frames."""
+
+    if not table:
+        return None
+    key_str = str(int(window_start))
+    if key_str in table:
+        return float(table[key_str])
+    key_int = int(window_start)
+    if key_int in table:
+        return float(table[key_int])
+    return None
 
 
 _VIDEO_DECODE_RUNTIME_MARKERS = (
@@ -250,12 +273,10 @@ class EveManifestRobotVideoDataset(RobotVideoDataset):
         failure events (D_fail). Ordinary success episodes and aux_success
         duplicates are dropped.
 
-        ``dewo_v9_pool`` / ``dewo_scratch_pool`` keep success episodes (D0),
-        success-event primaries (D+), and failure events (D_fail). aux_success
-        copies and full failure episodes are dropped. Sampling is a single
-        shuffle. D_fail is video BC only. Value target is the progress
-        return \(G_t=\gamma^{T-t}\) (fail frames 0). Scratch turns D+ video
-        BC on; v9 leaves it off.
+        ``dewo_v9_pool`` / ``dewo_scratch_pool`` keep D0 / D_scan / D_fail / D+.
+        v9.1 units set ``pool_role``. Legacy units without it keep the v9
+        primary-event / fail-event / success-episode rule. aux_success copies
+        and full failure episodes are dropped.
         """
 
         filt = getattr(self, "unit_filter", None)
@@ -270,6 +291,14 @@ class EveManifestRobotVideoDataset(RobotVideoDataset):
         raise ValueError(f"Unknown Eve `unit_filter` {filt!r}.")
 
     def _passes_dewo_v9_pool_filter(self, unit: dict[str, Any]) -> bool:
+        role_name = _pool_role(unit)
+        if role_name is not None:
+            filt = getattr(self, "unit_filter", None)
+            if filt == "dewo_v9_pool" and "expert_success" in str(
+                unit.get("dataset_id") or ""
+            ):
+                return False
+            return True
         role = self._sampling_role(unit)
         if role == "auxiliary_success":
             return False
@@ -438,6 +467,13 @@ class EveManifestRobotVideoDataset(RobotVideoDataset):
         unit: dict[str, Any],
         unit_filter: Optional[str] = None,
     ) -> str:
+        role_name = _pool_role(unit)
+        if role_name in {"d0", "d_scan"}:
+            return "base"
+        if role_name == "dplus":
+            return "primary"
+        if role_name == "d_fail":
+            return "aux_failure"
         if unit_filter in {"dewo_v9_pool", "dewo_scratch_pool"} and unit.get("sample_type") == "episode":
             return "base"
         role = cls._sampling_role(unit)
@@ -449,10 +485,24 @@ class EveManifestRobotVideoDataset(RobotVideoDataset):
 
     @classmethod
     def _v9_action_loss_weight(cls, unit: dict[str, Any]) -> float:
+        role_name = _pool_role(unit)
+        if role_name in {"d0", "dplus"}:
+            return 1.0
+        if role_name in {"d_scan", "d_fail"}:
+            return 0.0
         return 1.0 if cls._sampling_role(unit) == "primary" else 0.0
 
     @classmethod
     def _v9_video_loss_weight(cls, unit: dict[str, Any], *, dplus_video_bc: bool = False) -> float:
+        role_name = _pool_role(unit)
+        if role_name == "d0":
+            return 1.0
+        if role_name == "d_scan":
+            return 0.0
+        if role_name == "d_fail":
+            return 1.0
+        if role_name == "dplus":
+            return 1.0 if dplus_video_bc else 0.0
         role = cls._sampling_role(unit)
         if role == "auxiliary":
             return 1.0
@@ -470,10 +520,13 @@ class EveManifestRobotVideoDataset(RobotVideoDataset):
         *,
         gamma: float,
     ) -> float:
-        """Progress return on success; 0 on the fail cliff. No event floor."""
+        """v9.1: Pass@10 ``k/10`` on D_scan/D_fail. Legacy: progress return."""
 
         from fastwam.models.wan22.value_head import progress_return
 
+        if _pool_role(unit) is not None:
+            target, _weight = cls._v91_value_target(unit, window_start=window_start)
+            return target
         failed = cls._sampling_role(unit) == "auxiliary"
         horizon = int(unit.get("end_frame") or 0)
         return progress_return(
@@ -482,6 +535,34 @@ class EveManifestRobotVideoDataset(RobotVideoDataset):
             gamma=float(gamma),
             failed=failed,
         )
+
+    @classmethod
+    def _v91_value_target(
+        cls,
+        unit: dict[str, Any],
+        window_start: int | None = None,
+    ) -> tuple[float, float]:
+        """Return ``(target, value_loss_weight)``. No V loss without a Pass@10 label."""
+
+        role_name = _pool_role(unit)
+        if role_name in {"d_scan", "d_fail"}:
+            weight = float(unit.get("value_loss_weight", 1.0) or 0.0)
+            if unit.get("value_target") is not None:
+                return float(unit["value_target"]), weight
+            k = int(unit.get("success_count") or 0)
+            m = max(int(unit.get("pass_m") or 10), 1)
+            return float(k) / float(m), weight
+        if role_name == "d0":
+            labeled = _scan_value_at_frame(
+                unit.get("scan_value_by_frame"),
+                int(window_start) if window_start is not None else -1,
+            )
+            if labeled is None:
+                return 0.0, 0.0
+            return float(labeled), 1.0
+        if role_name == "dplus":
+            return 0.0, float(unit.get("value_loss_weight", 0.0) or 0.0)
+        return 0.0, 1.0
 
     def _apply_action_loss_window(
         self,
@@ -557,14 +638,19 @@ class EveManifestRobotVideoDataset(RobotVideoDataset):
         if video_w is not None:
             data["video_loss_weight"] = torch.tensor(video_w, dtype=torch.float32)
         if unit_filter in {"dewo_v9_pool", "dewo_scratch_pool"}:
-            data["value_target"] = torch.tensor(
-                self._v9_value_target(
+            if _pool_role(unit) is not None:
+                value_target, value_w = self._v91_value_target(
+                    unit, window_start=window_start
+                )
+            else:
+                value_target = self._v9_value_target(
                     unit,
                     window_start,
                     gamma=float(getattr(self, "value_gamma", 0.99)),
-                ),
-                dtype=torch.float32,
-            )
+                )
+                value_w = 1.0
+            data["value_target"] = torch.tensor(value_target, dtype=torch.float32)
+            data["value_loss_weight"] = torch.tensor(value_w, dtype=torch.float32)
         data["outcome_flag"] = torch.tensor(outcome_flag, dtype=torch.long)
         event_weight = unit.get("event_weight")
         pair_weight = unit.get("pair_weight")

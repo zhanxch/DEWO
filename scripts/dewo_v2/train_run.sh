@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Internal DEWO v9 tmux worker. Prefer:
-#   TASK=... INIT=s0 GPUS=... ENV_FILE=... bash scripts/dewo_v2/train.sh
+#   python scripts/train_dexjoco.py --task-name ... --init s0 --prepare-dir ... --gpus ...
 #
 # CFG mixing is set by train.sh, then forwarded into Hydra via oc.env.
 set -euo pipefail
@@ -216,8 +216,8 @@ else
   log "REQUIRE_VAE_LATENT_CACHE=0; skipping cache file preflight"
 fi
 
-if [[ "${DEWO_VERSION:-v9}" == "v9" ]]; then
-  log "v9: precompute Successful/Failed text embeds (overwrite=false)"
+if [[ "${DEWO_VERSION:-v9}" == v9* ]]; then
+  log "v9/v9.1: precompute Successful/Failed text embeds (overwrite=false)"
   python "${ROOT_DIR}/scripts/precompute_text_embeds.py" \\
     "task=${DEWO_TASK}" \\
     "+overwrite=false" \\

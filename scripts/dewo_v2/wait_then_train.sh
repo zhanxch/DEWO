@@ -4,7 +4,7 @@
 #     TRAIN_LAUNCHER=scripts/dewo_v2/train.sh \
 #     bash scripts/dewo_v2/wait_then_train.sh
 #
-# Do not source ENV_FILE here. train.sh sources it and owns CFG mixing.
+# Do not source ENV_FILE here. train_dexjoco.py loads it and owns CFG mixing.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

@@ -1,7 +1,7 @@
 # @package _global_
-# DEWO(scratch) on FastWAMJoint: full DiT from Wan + ActionDiT, not frozen-S0 KV.
-# Pool is still D0 / D+ / D_fail (dewo_scratch_pool). D+ has video BC.
-# Value head: V(s_t) on current-frame VideoDiT tokens, backbone stop-grad.
+# DEWO(scratch) FastWAMJoint, DEWO v9.1 pool.
+# D0 = expert ∪ collect; D_scan V=k/10; D_fail cliff video BC; D+ τ[t,t+33).
+# Value head: V(s_t) on current-frame VideoDiT tokens, backbone stop-grad, base text.
 # Mix video+action together; do not pin video to base.
 
 defaults:

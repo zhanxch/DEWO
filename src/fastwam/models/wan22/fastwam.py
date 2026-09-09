@@ -1309,11 +1309,13 @@ class FastWAM(torch.nn.Module):
                     frame = inputs.get("first_frame_latents")
                     if frame is None:
                         frame = input_latents[:, :, 0:1]
+                    value_context = sample.get("base_context", context)
+                    value_mask = sample.get("base_context_mask", context_mask)
                     with torch.no_grad():
                         tokens = self._encode_value_video_tokens(
                             frame.detach(),
-                            context,
-                            context_mask,
+                            value_context,
+                            value_mask,
                             bool(inputs.get("fuse_vae_embedding_in_latents", False)),
                         )
                     value_logits = head.logits(tokens.detach())
@@ -1328,12 +1330,26 @@ class FastWAM(torch.nn.Module):
                         "`value_target` batch mismatch: "
                         f"pred={tuple(pred_value.shape)} target={tuple(target_value.shape)}"
                     )
-                if loss_kind == VALUE_LOSS_HUBER:
-                    value_loss = F.smooth_l1_loss(pred_value, target_value)
+                value_w = sample.get("value_loss_weight", None)
+                if value_w is None:
+                    sample_w = torch.ones_like(target_value)
                 else:
-                    value_loss = F.binary_cross_entropy_with_logits(
-                        value_logits, target_value
+                    sample_w = value_w.to(
+                        device=pred_value.device, dtype=torch.float32, non_blocking=True
+                    ).view(-1)
+                    if sample_w.shape[0] != pred_value.shape[0]:
+                        raise ValueError(
+                            "`value_loss_weight` batch mismatch: "
+                            f"pred={tuple(pred_value.shape)} weight={tuple(sample_w.shape)}"
+                        )
+                if loss_kind == VALUE_LOSS_HUBER:
+                    per = F.smooth_l1_loss(pred_value, target_value, reduction="none")
+                    value_loss = (per * sample_w).sum() / sample_w.sum().clamp_min(1e-6)
+                else:
+                    per = F.binary_cross_entropy_with_logits(
+                        value_logits, target_value, reduction="none"
                     )
+                    value_loss = (per * sample_w).sum() / sample_w.sum().clamp_min(1e-6)
                 value_loss = torch.nan_to_num(
                     value_loss,
                     nan=0.0,
@@ -1394,6 +1410,8 @@ class FastWAM(torch.nn.Module):
             )
             loss_dict["value_pred_mean"] = float(pred_value.detach().mean().item())
             loss_dict["value_target_mean"] = float(target_value.detach().mean().item())
+            if "sample_w" in locals():
+                loss_dict["value_weight_mean"] = float(sample_w.detach().mean().item())
         if cliff_loss is not None:
             loss_dict["loss_value_cliff"] = float(
                 (getattr(self, "value_cliff_lambda", 0.0) or 0.0) * cliff_loss.detach().item()

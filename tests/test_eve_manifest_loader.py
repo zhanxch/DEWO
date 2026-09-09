@@ -1018,6 +1018,71 @@ class EveManifestLoaderTest(unittest.TestCase):
 
         self.assertEqual(float(data["action_loss_weight"]), 1.0)
         self.assertEqual(float(data["video_loss_weight"]), 1.0)
+        self.assertEqual(float(data["value_loss_weight"]), 1.0)
+
+
+class DewoV91PoolFilterTest(unittest.TestCase):
+    def test_pool_role_weights_and_cfg(self) -> None:
+        dataset = EveManifestRobotVideoDataset.__new__(EveManifestRobotVideoDataset)
+        dataset.unit_filter = "dewo_scratch_pool"
+        d0 = {"pool_role": "d0", "sample_type": "episode", "dataset_id": "task_s0_success_rollouts"}
+        scan = {
+            "pool_role": "d_scan",
+            "sample_type": "event",
+            "success_count": 7,
+            "pass_m": 10,
+            "value_target": 0.7,
+        }
+        fail = {
+            "pool_role": "d_fail",
+            "sample_type": "event",
+            "success_count": 0,
+            "pass_m": 10,
+            "value_target": 0.0,
+        }
+        dplus = {"pool_role": "dplus", "sample_type": "event"}
+        expert = {
+            "pool_role": "d0",
+            "sample_type": "episode",
+            "dataset_id": "fold_glasses_expert_success",
+        }
+        self.assertTrue(dataset._passes_unit_filter(d0))
+        self.assertTrue(dataset._passes_unit_filter(scan))
+        self.assertTrue(dataset._passes_unit_filter(fail))
+        self.assertTrue(dataset._passes_unit_filter(dplus))
+        self.assertTrue(dataset._passes_unit_filter(expert))
+        dataset.unit_filter = "dewo_v9_pool"
+        self.assertFalse(dataset._passes_unit_filter(expert))
+        self.assertEqual(dataset._v9_action_loss_weight(d0), 1.0)
+        self.assertEqual(dataset._v9_video_loss_weight(d0), 1.0)
+        self.assertEqual(dataset._cfg_schedule(d0, unit_filter="dewo_scratch_pool"), "base")
+        self.assertEqual(dataset._v9_action_loss_weight(scan), 0.0)
+        self.assertEqual(dataset._v9_video_loss_weight(scan), 0.0)
+        self.assertEqual(dataset._cfg_schedule(scan, unit_filter="dewo_scratch_pool"), "base")
+        self.assertEqual(dataset._v9_action_loss_weight(fail), 0.0)
+        self.assertEqual(dataset._v9_video_loss_weight(fail), 1.0)
+        self.assertEqual(dataset._cfg_schedule(fail, unit_filter="dewo_scratch_pool"), "aux_failure")
+        self.assertEqual(
+            dataset._v9_video_loss_weight(dplus, dplus_video_bc=True),
+            1.0,
+        )
+        self.assertEqual(dataset._v9_video_loss_weight(dplus), 0.0)
+        self.assertEqual(dataset._cfg_schedule(dplus, unit_filter="dewo_scratch_pool"), "primary")
+        self.assertEqual(dataset._v91_value_target(scan), (0.7, 1.0))
+        self.assertEqual(dataset._v91_value_target(fail), (0.0, 1.0))
+        self.assertEqual(dataset._v91_value_target(d0), (0.0, 0.0))
+        self.assertEqual(dataset._v91_value_target(dplus), (0.0, 0.0))
+        collect = {
+            "pool_role": "d0",
+            "sample_type": "episode",
+            "dataset_id": "fold_glasses_s0_success_rollouts",
+            "scan_value_by_frame": {"48": 1.0, "72": 0.9},
+        }
+        self.assertEqual(dataset._v91_value_target(collect, window_start=48), (1.0, 1.0))
+        self.assertEqual(dataset._v91_value_target(collect, window_start=72), (0.9, 1.0))
+        self.assertEqual(dataset._v91_value_target(collect, window_start=49), (0.0, 0.0))
+        self.assertEqual(dataset._v91_value_target(collect), (0.0, 0.0))
+        self.assertEqual(dataset._v91_value_target(expert, window_start=48), (0.0, 0.0))
 
 
 if __name__ == "__main__":
